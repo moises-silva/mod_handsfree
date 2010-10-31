@@ -7,17 +7,16 @@ int main(int argc, char *argv[])
 	DBusGConnection *connection;
 	GError *error;
 	DBusGProxy *proxy;
-	char **name_list;
-	char **name_list_ptr;
+	
+	GValue *gentype;
 
 	g_type_init();
 
+	gentype = g_new0(GValue, 1);
+	g_value_init(value, dbus_get_type_get_struct("GValueArray", G_TYPE_OBJECT, G_TYPE_ARRAY, G_TYPE_INVALID));
+
 	error = NULL;
-#if 0
-	connection = dbus_g_bus_get(DBUS_BUS_SESSION, &error);
-#else
 	connection = dbus_g_bus_get(DBUS_BUS_SYSTEM, &error);
-#endif
 
 	if (!connection) {
 		g_printerr("Failed to open connection to bus: %s\n", error->message);
@@ -26,14 +25,14 @@ int main(int argc, char *argv[])
 	}
 
 	proxy = dbus_g_proxy_new_for_name(connection, 
-					  DBUS_SERVICE_DBUS,
-					  DBUS_PATH_DBUS,
-					  DBUS_INTERFACE_DBUS);
+					  "org.ofono",
+					  "/",
+					  "org.ofono.Manager");
 
 	error = NULL;
-	if (!dbus_g_proxy_call(proxy, "ListNames", &error, 
-				G_TYPE_INVALID, G_TYPE_STRV, 
-				&name_list, G_TYPE_INVALID)) {
+	if (!dbus_g_proxy_call(proxy, "GetModems", &error, 
+				G_TYPE_INVALID, DBUS_TYPE_G_UCHAR_ARRAY, 
+				&gentype, G_TYPE_INVALID)) {
 		if (error->domain == DBUS_GERROR && 
 		    error->code == DBUS_GERROR_REMOTE_EXCEPTION) {
 			g_printerr("Caught remote method exception %s: %s\n", 
@@ -45,13 +44,10 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	g_print("Names on the message bus: \n");
+	g_print("Modems: %d\n", gentype->len);
 
-	for (name_list_ptr = name_list; *name_list_ptr; name_list_ptr++) {
-		g_print("	%s\n", *name_list_ptr);
-	}
+	//g_value_unset(&gentype);
 
-	g_strfreev(name_list);
 	g_object_unref(proxy);
 
 	exit(0);
