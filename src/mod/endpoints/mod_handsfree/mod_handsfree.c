@@ -682,6 +682,8 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 	int fromfs[2];
 	int pid;
 	int fd;
+	char *c;
+	char *event;
 	char *argv[] = { MONITOR_SCRIPT, NULL };
 	char linebuf[2048];
 	char cmdpath[1024];
@@ -748,7 +750,20 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 					break;
 				}
 				linebuf[rc] = 0;
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s", linebuf);
+				event = linebuf;
+				do {
+					c = strchr(event, '\n');
+					if (c) {
+						*c = '\0';
+					}
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s\n", event);
+					if (c) {
+						event = c;
+						event++;
+					} else {
+						event = NULL;
+					}
+				} while (event && *event);
 			} else if (POLLERR & fdset.revents) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Poll error when waiting ofono events\n");
 				break;
