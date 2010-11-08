@@ -29,17 +29,33 @@
  *
  */
 #include <switch.h>
+#include <poll.h>
+#include <sys/wait.h>
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown);
-//SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime);
-SWITCH_MODULE_DEFINITION(mod_handsfree, mod_handsfree_load, mod_handsfree_shutdown, NULL);	//mod_handsfree_runtime);
+SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime);
+SWITCH_MODULE_DEFINITION(mod_handsfree, mod_handsfree_load, mod_handsfree_shutdown, mod_handsfree_runtime);
+
+typedef enum {
+	GFLAG_MY_CODEC_PREFS = (1 << 0)
+} GFLAGS;
 
 
-switch_endpoint_interface_t *handsfree_endpoint_interface;
-static switch_memory_pool_t *module_pool = NULL;
-static int running = 1;
-
+static struct {
+	char *codec_string;
+	char *codec_order[SWITCH_MAX_CODECS];
+	int codec_order_last;
+	char *codec_rates_string;
+	char *codec_rates[SWITCH_MAX_CODECS];
+	int codec_rates_last;
+	unsigned int flags;
+	int calls;
+	switch_mutex_t *mutex;
+	uint8_t debug;
+	volatile uint8_t running;
+	volatile uint8_t thread_running;
+} globals;
 
 typedef enum {
 	TFLAG_IO = (1 << 0),
@@ -53,27 +69,8 @@ typedef enum {
 	TFLAG_BREAK = (1 << 8)
 } TFLAGS;
 
-typedef enum {
-	GFLAG_MY_CODEC_PREFS = (1 << 0)
-} GFLAGS;
-
-
-static struct {
-	int debug;
-	char *ip;
-	int port;
-	char *dialplan;
-	char *codec_string;
-	char *codec_order[SWITCH_MAX_CODECS];
-	int codec_order_last;
-	char *codec_rates_string;
-	char *codec_rates[SWITCH_MAX_CODECS];
-	int codec_rates_last;
-	unsigned int flags;
-	int calls;
-	switch_mutex_t *mutex;
-} globals;
-
+switch_endpoint_interface_t *handsfree_endpoint_interface;
+static switch_memory_pool_t *module_pool = NULL;
 struct private_object {
 	unsigned int flags;
 	switch_codec_t read_codec;
@@ -84,18 +81,9 @@ struct private_object {
 	switch_caller_profile_t *caller_profile;
 	switch_mutex_t *mutex;
 	switch_mutex_t *flag_mutex;
-	//switch_thread_cond_t *cond;
 };
 
 typedef struct private_object private_t;
-
-
-SWITCH_DECLARE_GLOBAL_STRING_FUNC(set_global_dialplan, globals.dialplan);
-SWITCH_DECLARE_GLOBAL_STRING_FUNC(set_global_codec_string, globals.codec_string);
-SWITCH_DECLARE_GLOBAL_STRING_FUNC(set_global_codec_rates_string, globals.codec_rates_string);
-SWITCH_DECLARE_GLOBAL_STRING_FUNC(set_global_ip, globals.ip);
-
-
 
 static switch_status_t channel_on_init(switch_core_session_t *session);
 static switch_status_t channel_on_hangup(switch_core_session_t *session);
@@ -110,7 +98,6 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 static switch_status_t channel_read_frame(switch_core_session_t *session, switch_frame_t **frame, switch_io_flag_t flags, int stream_id);
 static switch_status_t channel_write_frame(switch_core_session_t *session, switch_frame_t *frame, switch_io_flag_t flags, int stream_id);
 static switch_status_t channel_kill_channel(switch_core_session_t *session, int sig);
-
 
 
 static void tech_init(private_t *tech_pvt, switch_core_session_t *session)
@@ -223,7 +210,6 @@ static switch_status_t channel_on_hangup(switch_core_session_t *session)
 
 	switch_clear_flag_locked(tech_pvt, TFLAG_IO);
 	switch_clear_flag_locked(tech_pvt, TFLAG_VOICE);
-	//switch_thread_cond_signal(tech_pvt->cond);
 
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "%s CHANNEL HANGUP\n", switch_channel_get_name(channel));
@@ -250,18 +236,14 @@ static switch_status_t channel_kill_channel(switch_core_session_t *session, int 
 
 	switch (sig) {
 	case SWITCH_SIG_KILL:
-		switch_clear_flag_locked(tech_pvt, TFLAG_IO);
-		switch_clear_flag_locked(tech_pvt, TFLAG_VOICE);
-		switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_CLEARING);
-		//switch_thread_cond_signal(tech_pvt->cond);
 		break;
 	case SWITCH_SIG_BREAK:
-		switch_set_flag_locked(tech_pvt, TFLAG_BREAK);
 		break;
 	default:
 		break;
 	}
 
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "CHANNEL KILL %d\n", sig);
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -289,8 +271,6 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 {
 	switch_channel_t *channel = NULL;
 	private_t *tech_pvt = NULL;
-	//switch_time_t started = switch_time_now();
-	//unsigned int elapsed;
 	switch_byte_t *data;
 
 	channel = switch_core_session_get_channel(session);
@@ -516,32 +496,8 @@ static switch_status_t load_config(void)
 
 			if (!strcmp(var, "debug")) {
 				globals.debug = atoi(val);
-			} else if (!strcmp(var, "port")) {
-				globals.port = atoi(val);
-			} else if (!strcmp(var, "ip")) {
-				set_global_ip(val);
-			} else if (!strcmp(var, "codec-master")) {
-				if (!strcasecmp(val, "us")) {
-					switch_set_flag(&globals, GFLAG_MY_CODEC_PREFS);
-				}
-			} else if (!strcmp(var, "dialplan")) {
-				set_global_dialplan(val);
-			} else if (!strcmp(var, "codec-prefs")) {
-				set_global_codec_string(val);
-				globals.codec_order_last = switch_separate_string(globals.codec_string, ',', globals.codec_order, SWITCH_MAX_CODECS);
-			} else if (!strcmp(var, "codec-rates")) {
-				set_global_codec_rates_string(val);
-				globals.codec_rates_last = switch_separate_string(globals.codec_rates_string, ',', globals.codec_rates, SWITCH_MAX_CODECS);
 			}
 		}
-	}
-
-	if (!globals.dialplan) {
-		set_global_dialplan("default");
-	}
-
-	if (!globals.port) {
-		globals.port = 4569;
 	}
 
 	switch_xml_free(xml);
@@ -549,9 +505,41 @@ static switch_status_t load_config(void)
 	return SWITCH_STATUS_SUCCESS;
 }
 
+SWITCH_STANDARD_API(handsf_function)
+{
+	char *argv[10];
+	char *mydata;
+	int argc;
+
+	if (zstr(cmd)) {
+		stream->write_function(stream, "-ERR Parameter missing");
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	if (!(mydata = strdup(cmd))) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (!(argc = switch_separate_string(mydata, ' ', argv, (sizeof(argv)/sizeof(argv[0])))) || !argv[0]) {
+		goto end;
+	}
+
+	if (!strcasecmp(argv[0], "list")) {
+		stream->write_function(stream, "Modems:");
+	} else {
+		stream->write_function(stream, "-ERR Invalid parameter");
+	}
+
+end:
+	switch_safe_free(mydata);
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
+#define HANDS_FREE_SYNTAX "handsfree list"
 SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 {
-
+	switch_api_interface_t *commands_api_interface;
 	module_pool = pool;
 
 	memset(&globals, 0, sizeof(globals));
@@ -564,38 +552,107 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 	handsfree_endpoint_interface->io_routines = &handsfree_io_routines;
 	handsfree_endpoint_interface->state_handler = &handsfree_state_handlers;
 
+	SWITCH_ADD_API(commands_api_interface, "handsfree", "Hands Free Endpoint Commands", handsf_function, HANDS_FREE_SYNTAX);
 
+	switch_console_set_complete("add handsfree list");
 
 	/* indicate that the module should continue to be loaded */
+	globals.running = 1;
 	return SWITCH_STATUS_SUCCESS;
 }
 
-/*
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 {
+	int tofs[2];
+	int fromfs[2];
+	int pid;
+	int fd;
+	char *argv[] = { "monitor-ofono", NULL };
+	char linebuf[2048];
+	char cmdpath[1024];
+	struct pollfd fdset;
+	int rc = 0;
+
+	snprintf(cmdpath, sizeof(cmdpath), "%s%s%s", SWITCH_GLOBAL_dirs.script_dir, SWITCH_PATH_SEPARATOR, "monitor-ofono");
+
+	if (pipe(tofs)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create pipe to monitor ofono events\n");
+		return SWITCH_STATUS_TERM;
+	}
+
+	if (pipe(fromfs)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create pipe to monitor ofono events\n");
+		return SWITCH_STATUS_TERM;
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Launching command %s\n", cmdpath);
+
+	pid = fork();
+	if (pid < 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to fork to monitor ofono events\n");
+		return SWITCH_STATUS_TERM;
+	}
+
+	if (!pid) {
+		dup2(fromfs[0], STDIN_FILENO);
+		dup2(tofs[1], STDOUT_FILENO);
+		for (fd = STDERR_FILENO + 1; fd < (2^65536); fd++) {
+			close(fd);
+		}
+		execv(cmdpath, argv);
+		exit(0);
+	}
+
+	globals.thread_running = 1;
+	fdset.fd = tofs[0];
+	fdset.events = POLLIN | POLLERR;
+	while (globals.running) {
+		rc = poll(&fdset, 1, 100);
+		if (rc < 0) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to poll ofono events: %s\n", strerror(errno));
+			break;
+		}
+		if (!rc) {
+			continue;
+		}
+		if (rc > 0) {
+			if (POLLIN & fdset.revents) {
+				rc = read(tofs[0], linebuf, sizeof(linebuf)-1);
+				if (rc < 0) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to read ofono events: %s\n", strerror(errno));
+					break;
+				}
+				if (rc == 0) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "No ofono events\n");
+					break;
+				}
+				linebuf[rc] = 0;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s", linebuf);
+			} else if (POLLERR & fdset.revents) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Poll error when waiting ofono events\n");
+				break;
+			} else {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Unknown flags when waiting ofono events: %d\n", fdset.revents);
+				break;
+			}
+		}
+	}
+	kill(pid, SIGTERM);
+	waitpid(pid, NULL, 0);
+	globals.thread_running = 0;
 	return SWITCH_STATUS_TERM;
 }
-*/
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown)
 {
-	int x = 0;
-
-	running = -1;
-
-	while (running) {
-		if (x++ > 100) {
-			break;
-		}
-		switch_yield(20000);
-	}
-
 	/* Free dynamically allocated strings */
-	switch_safe_free(globals.dialplan);
 	switch_safe_free(globals.codec_string);
 	switch_safe_free(globals.codec_rates_string);
-	switch_safe_free(globals.ip);
-
+	globals.running = 0;
+	while (globals.thread_running) {
+		switch_yield(100000);
+	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Handsfree Done!\n");
 	return SWITCH_STATUS_SUCCESS;
 }
 
