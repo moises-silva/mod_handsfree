@@ -505,6 +505,121 @@ static switch_status_t load_config(void)
 	return SWITCH_STATUS_SUCCESS;
 }
 
+static void execute_script(switch_stream_handle_t *stream, char *script)
+{
+	char cmdpath[1024];
+	char linebuf[2048];
+	struct pollfd fdset;
+	int rc = 0;
+	int tofs[2];
+	int fromfs[2];
+	int pid;
+	int fd;
+	char *argv[] = { script, NULL };
+
+	snprintf(cmdpath, sizeof(cmdpath), "%s%s%s", SWITCH_GLOBAL_dirs.script_dir, SWITCH_PATH_SEPARATOR, script);
+
+	if (pipe(tofs)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create pipe to monitor ofono events\n");
+		return;
+	}
+
+	if (pipe(tofs)) {
+		close(tofs[0]);
+		close(tofs[1]);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create pipe to monitor ofono events\n");
+		return;
+	}
+
+	if (pipe(fromfs)) {
+		close(tofs[0]);
+		close(tofs[1]);
+		close(fromfs[0]);
+		close(fromfs[1]);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create pipe to monitor ofono events\n");
+		return;
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Launching command %s\n", cmdpath);
+
+	pid = fork();
+	if (pid < 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to fork to execute script %s\n", cmdpath);
+		close(tofs[0]);
+		close(tofs[1]);
+		close(fromfs[0]);
+		close(fromfs[1]);
+		return;
+	}
+
+	if (!pid) {
+		dup2(fromfs[0], STDIN_FILENO);
+		dup2(tofs[1], STDOUT_FILENO);
+		for (fd = STDERR_FILENO + 1; fd < (2^65536); fd++) {
+			close(fd);
+		}
+		execv(cmdpath, argv);
+		exit(0);
+	}
+
+	fdset.fd = tofs[0];
+	fdset.events = POLLIN | POLLERR;
+	while (globals.running) {
+		rc = waitpid(pid, NULL, WNOHANG);
+		if (rc < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to wait for script %s: %s\n", script, strerror(errno));
+			break;
+		}
+		if (rc > 0) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "script %s terminated\n", script);
+			break;
+		}
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "script %s running\n", script);
+		rc = poll(&fdset, 1, 100);
+		if (rc < 0) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to poll output of script %s: %s\n", script, strerror(errno));
+			break;
+		}
+		if (!rc) {
+			continue;
+		}
+		if (rc > 0) {
+			if (POLLIN & fdset.revents) {
+				rc = read(tofs[0], linebuf, sizeof(linebuf)-1);
+				if (rc < 0) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to read script output: %s\n", strerror(errno));
+					break;
+				}
+				if (rc == 0) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "No script output?\n");
+					break;
+				}
+				linebuf[rc] = 0;
+				stream->write_function(stream, "%s", linebuf);
+			} else if (POLLERR & fdset.revents) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Poll error when waiting for script output\n");
+				break;
+			} else {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Unknown flags when waiting script output: %d\n", fdset.revents);
+				break;
+			}
+		}
+	}
+	close(tofs[0]);
+	close(tofs[1]);
+	close(fromfs[0]);
+	close(fromfs[1]);
+	if (!globals.running) {
+		kill(pid, SIGTERM);
+		waitpid(pid, NULL, 0);
+	}
+}
+
+#define LIST_MODEMS_SCRIPT "list-modems"
+#define MONITOR_SCRIPT "monitor-ofono"
 SWITCH_STANDARD_API(handsf_function)
 {
 	char *argv[10];
@@ -525,7 +640,7 @@ SWITCH_STANDARD_API(handsf_function)
 	}
 
 	if (!strcasecmp(argv[0], "list")) {
-		stream->write_function(stream, "Modems:");
+		execute_script(stream, LIST_MODEMS_SCRIPT);	
 	} else {
 		stream->write_function(stream, "-ERR Invalid parameter");
 	}
@@ -567,13 +682,13 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 	int fromfs[2];
 	int pid;
 	int fd;
-	char *argv[] = { "monitor-ofono", NULL };
+	char *argv[] = { MONITOR_SCRIPT, NULL };
 	char linebuf[2048];
 	char cmdpath[1024];
 	struct pollfd fdset;
 	int rc = 0;
 
-	snprintf(cmdpath, sizeof(cmdpath), "%s%s%s", SWITCH_GLOBAL_dirs.script_dir, SWITCH_PATH_SEPARATOR, "monitor-ofono");
+	snprintf(cmdpath, sizeof(cmdpath), "%s%s%s", SWITCH_GLOBAL_dirs.script_dir, SWITCH_PATH_SEPARATOR, MONITOR_SCRIPT);
 
 	if (pipe(tofs)) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create pipe to monitor ofono events\n");
@@ -581,6 +696,8 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 	}
 
 	if (pipe(fromfs)) {
+		close(tofs[0]);
+		close(tofs[1]);
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create pipe to monitor ofono events\n");
 		return SWITCH_STATUS_TERM;
 	}
@@ -589,6 +706,10 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 
 	pid = fork();
 	if (pid < 0) {
+		close(tofs[0]);
+		close(tofs[1]);
+		close(fromfs[0]);
+		close(fromfs[1]);
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to fork to monitor ofono events\n");
 		return SWITCH_STATUS_TERM;
 	}
@@ -637,6 +758,10 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 			}
 		}
 	}
+	close(tofs[0]);
+	close(tofs[1]);
+	close(fromfs[0]);
+	close(fromfs[1]);
 	kill(pid, SIGTERM);
 	waitpid(pid, NULL, 0);
 	globals.thread_running = 0;
