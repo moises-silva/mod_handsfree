@@ -31,6 +31,10 @@
 #include <switch.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <poll.h>
+#include <fcntl.h>
+#include "ipc.h"
+
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown);
@@ -64,6 +68,7 @@ static struct {
 	volatile uint8_t thread_running;
 	switch_hash_t *modems;
 	switch_memory_pool_t *module_pool;
+	int audio_service_fd;
 } globals;
 
 typedef enum {
@@ -106,6 +111,485 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 static switch_status_t channel_read_frame(switch_core_session_t *session, switch_frame_t **frame, switch_io_flag_t flags, int stream_id);
 static switch_status_t channel_write_frame(switch_core_session_t *session, switch_frame_t *frame, switch_io_flag_t flags, int stream_id);
 static switch_status_t channel_kill_channel(switch_core_session_t *session, int sig);
+
+/** SCO audio stuff **/
+
+/* SCO connections work with 48 byte-sized frames only */
+#define SCO_PCM_MTU 48
+
+static int loop_read(int sock, char *buf, ssize_t len)
+{
+	int r;
+	int ret = 0;
+
+	while (len > 0) {
+		r = read(sock, buf, len);
+		if (r < 0 ) {
+			return r;
+		}
+		if (!r) {
+			break;
+		}
+		ret += r;
+		buf += r;
+		len -= r;
+	}
+	return ret;
+}
+
+static int loop_write(int sock, char *buf, ssize_t len)
+{
+	int r = 0;
+	int ret = 0;
+	while (len > 0) {
+		r = write(sock, buf, len);
+		if (r < 0) {
+			return r;
+		}
+		if (!r) {
+			break;
+		}
+		ret += r;
+		buf += r;
+		len -= r;
+	}
+	return ret;
+}	
+
+static int send_message(int servicefd, const bt_audio_msg_header_t *msg)
+{
+	ssize_t r;
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Sending %s -> %s\n", bt_audio_strtype(msg->type), bt_audio_strname(msg->name));
+	r = loop_write(servicefd, (char *)msg, msg->length);
+	if (r < 0) {
+		perror("write");
+		return -1;
+	}
+	if (r != msg->length) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Only wrote %d bytes out of %d\n", r, msg->length);
+		return -1;
+	}
+	return 0;
+}
+
+static int read_message(int svcsock, bt_audio_msg_header_t *msg, size_t max)
+{
+	ssize_t r = 0;
+	size_t payloadlen = 0;
+	char *payload = 0;
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Trying to receive message from audio service\n");
+
+	r = loop_read(svcsock, (char *)msg, sizeof(*msg));
+
+	if (r < 0) {
+		perror("read");
+		return -1;
+	}
+
+	if (!r) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Bluez server closed the connection\n");
+		return -1;
+	}
+
+	if (r != sizeof(*msg)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "read only %d out of %d bytes, discarding ...\n", r, sizeof(*msg));
+		return -1;
+	}
+
+	if (msg->length > max) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Not enough room to fit %d bytes, only room for %d, discarding ...\n", r, max);
+		return -1;
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Received %s <- %s of length %d ... reading payload ...\n", bt_audio_strtype(msg->type), bt_audio_strname(msg->name), msg->length);
+	if (msg->length > sizeof(*msg)) {
+		payloadlen = msg->length - sizeof(*msg);
+		payload = ((char *)msg) + sizeof(*msg);
+		r = loop_read(svcsock, payload, payloadlen);
+		if (r < 0) {
+			perror("read");
+			return -1;
+		}
+		if (!r) {
+			printf("Server closed the connection\n");
+			return -1;
+		}
+		if (r != payloadlen) {
+			fprintf(stderr, "read only %d out of %d payload bytes, discarding ...\n", r, sizeof(*msg));
+			return -1;
+		}
+	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Finished receiving %s <- %s of length %d\n", bt_audio_strtype(msg->type), bt_audio_strname(msg->name), msg->length);
+	return 0;
+}
+
+static int print_caps(int servicefd, char *obj)
+{
+	uint16_t bytes_left;
+	const codec_capabilities_t *codec;
+	int r = 0;
+	union {
+		struct bt_get_capabilities_req req;
+		struct bt_get_capabilities_rsp rsp;
+		bt_audio_error_t error;
+		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
+	} msg;
+
+	memset(&msg, 0, sizeof(msg));
+
+	msg.req.h.type = BT_REQUEST;
+	msg.req.h.name = BT_GET_CAPABILITIES;
+	msg.req.h.length = sizeof(msg.req);
+	msg.req.seid = 0;
+
+	//msg.req.flags = BT_FLAG_AUTOCONNECT;
+	msg.req.flags = 0;
+
+	snprintf(msg.req.object, sizeof(msg.req.object), "%s", obj);
+	msg.req.transport = BT_CAPABILITIES_TRANSPORT_SCO;
+
+	r = send_message(servicefd, &msg.req.h);
+	if (r < 0) {
+		return r;
+	}
+
+	r = read_message(servicefd, &msg.rsp.h, sizeof(msg));
+	if (r < 0) {
+		return r;
+	}
+	if (msg.rsp.h.type == BT_ERROR) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to get capabilities\n");
+		return -1;
+	}
+
+	bytes_left = msg.rsp.h.length - sizeof(msg.rsp);
+	codec = (codec_capabilities_t *)msg.rsp.data;
+
+	if (bytes_left < sizeof(*codec)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "%lu bytes are not enough to hold codec data of length %lu\n", 
+				(unsigned long)bytes_left, (unsigned long)sizeof(*codec));
+		return -1;
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Payload size is %lu %lu\n", (unsigned long)bytes_left, (unsigned long)sizeof(*codec));
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Codec Seid: %d\n", codec->seid);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Codec Transport: %d\n", codec->transport);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Codec Type: %d\n", codec->type);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Codec Length: %d\n", codec->length);
+	
+	return 0;
+}
+
+static int open_device(int servicefd, char *obj)
+{
+	int r = 0;
+	union {
+		struct bt_open_req open_req;
+		struct bt_open_rsp open_rsp;
+		struct bt_set_configuration_req setconf_req;
+		struct bt_set_configuration_rsp setconf_rsp;
+		bt_audio_error_t error;
+		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
+	} msg;
+
+	/* now open the device */
+	memset(&msg, 0, sizeof(msg));
+
+	msg.open_req.h.type = BT_REQUEST;
+	msg.open_req.h.name = BT_OPEN;
+	msg.open_req.h.length = sizeof(msg.open_req);
+	msg.open_req.seid = 0;
+
+	snprintf(msg.open_req.object, sizeof(msg.open_req.object), "%s", obj);
+	/* QUESTION: What is this SEID RANGE thing? */
+	msg.open_req.seid = BT_A2DP_SEID_RANGE + 1;
+	/* QUESTION: what are those 2 locks? */
+	msg.open_req.lock = BT_READ_LOCK | BT_WRITE_LOCK;
+
+	r = send_message(servicefd, &msg.open_req.h);
+	if (r < 0) {
+		return r;
+	}
+
+	r = read_message(servicefd, &msg.open_rsp.h, sizeof(msg));
+	if (r < 0) {
+		return r;
+	}
+	if (msg.open_rsp.h.type == BT_ERROR) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to open device %s\n", obj);
+		return -1;
+	}
+
+	/* at this point device is open. It seems for HFP we always have: LINEAR16, 1 channel at 8khz
+	 * is time to configure ...  */
+	memset(&msg, 0, sizeof(msg));
+
+	/* QUESTION: is the request configuration global? why no device is specified? */
+	msg.setconf_req.h.type = BT_REQUEST;
+	msg.setconf_req.h.name = BT_SET_CONFIGURATION;
+	msg.setconf_req.h.length = sizeof(msg.setconf_req);
+
+	msg.setconf_req.codec.transport = BT_CAPABILITIES_TRANSPORT_SCO;
+	msg.setconf_req.codec.seid = BT_A2DP_SEID_RANGE + 1;
+	msg.setconf_req.codec.length = sizeof(pcm_capabilities_t);
+	msg.setconf_req.h.length += msg.setconf_req.codec.length - sizeof(msg.setconf_req.codec);
+
+	r = send_message(servicefd, &msg.setconf_req.h);
+	if (r < 0) {
+		return r;
+	}
+
+	r = read_message(servicefd, &msg.setconf_rsp.h, sizeof(msg));
+	if (r < 0) {
+		return r;
+	}
+	if (msg.setconf_rsp.h.type == BT_ERROR) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to configure device %s\n", obj);
+		return -1;
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Device %s configured successfuly, MTU = %d\n", obj, msg.setconf_rsp.link_mtu);
+	if (msg.setconf_rsp.link_mtu != SCO_PCM_MTU) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Unsupported MTU %d, we support %d\n", msg.setconf_rsp.link_mtu, SCO_PCM_MTU);
+		return -1;
+	}
+	return 0;
+}
+
+static int close_device(int servicefd, char *obj)
+{
+	int r = 0;
+	union {
+		struct bt_close_req close_req;
+		struct bt_close_rsp close_rsp;
+		bt_audio_error_t error;
+		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
+	} msg;
+
+	/* now close the device */
+	memset(&msg, 0, sizeof(msg));
+
+	msg.close_req.h.type = BT_REQUEST;
+	msg.close_req.h.name = BT_CLOSE;
+	msg.close_req.h.length = sizeof(msg.close_req);
+
+	r = send_message(servicefd, &msg.close_req.h);
+	if (r < 0) {
+		return r;
+	}
+
+	r = read_message(servicefd, &msg.close_rsp.h, sizeof(msg));
+	if (r < 0) {
+		return r;
+	}
+	if (msg.close_rsp.h.type == BT_ERROR) {
+		fprintf(stderr, "Failed to close device %s\n", obj);
+		return -1;
+	}
+	printf("Closed device %s\n", obj);
+	return 0;
+}
+
+static int start_stream(int servicefd, char *obj)
+{
+	int pcmsock = -1;
+	int f = 0;
+	int r = 0;
+#if 0
+	int priority = 0;
+	int one = 0;
+#endif
+	union {
+		bt_audio_msg_header_t rsp;
+		struct bt_start_stream_req start_req;
+		struct bt_start_stream_rsp start_rsp;
+		struct bt_new_stream_ind stream_ind;
+		bt_audio_error_t error;
+		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
+	} msg;
+
+	/* start streaming! */
+	memset(&msg, 0, sizeof(msg));
+
+	msg.start_req.h.type = BT_REQUEST;
+	msg.start_req.h.name = BT_START_STREAM;
+	msg.start_req.h.length = sizeof(msg.start_req);
+
+	r = send_message(servicefd, &msg.start_req.h);
+	if (r < 0) {
+		return r;
+	}
+
+	r = read_message(servicefd, &msg.start_rsp.h, sizeof(msg));	
+	if (r < 0) {
+		return r;
+	}
+	if (msg.start_rsp.h.type == BT_ERROR) {
+		fprintf(stderr, "Failed to start streaming from device %s\n", obj);
+		return -1;
+	}
+
+	r = read_message(servicefd, &msg.stream_ind.h, sizeof(msg));
+	if (r < 0) {
+		return r;
+	}
+	if (msg.stream_ind.h.type != BT_INDICATION 
+	    || msg.stream_ind.h.name != BT_NEW_STREAM) {
+		fprintf(stderr, "Stream indication error on device %s\n", obj);
+		return -1;
+	}
+
+	pcmsock = bt_audio_service_get_data_fd(servicefd);
+	if (pcmsock < 0) {
+		fprintf(stderr, "Failed to retrieve pcm socket for device %s\n", obj);
+		return pcmsock;
+	}
+	f = fcntl(pcmsock, F_GETFL);
+	if (!(f & O_NONBLOCK)) {
+		fcntl(pcmsock, F_SETFL, f | O_NONBLOCK);
+	}
+#if 0
+	priority = 6;
+	setsockopt(pcmsock, SOL_SOCKET, SO_PRIORITY, (void*)&priority, sizeof(priority));
+	timestamp is used with recvmsg to get a timestamp of when the datagram was received
+	one = 1;
+	setsockopt(pcmsock, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof(one));
+#endif
+	printf("Got pcm socket %d!\n", pcmsock);
+	return pcmsock;
+}
+
+static int stop_stream(int servicefd, char *obj)
+{
+	int r = 0;
+	union {
+		bt_audio_msg_header_t rsp;
+		struct bt_start_stream_req start_req;
+		struct bt_start_stream_rsp start_rsp;
+		bt_audio_error_t error;
+		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
+	} msg;
+
+	/* start streaming! */
+	memset(&msg, 0, sizeof(msg));
+
+	msg.start_req.h.type = BT_REQUEST;
+	msg.start_req.h.name = BT_STOP_STREAM;
+	msg.start_req.h.length = sizeof(msg.start_req);
+
+	r = send_message(servicefd, &msg.start_req.h);
+	if (r < 0) {
+		return r;
+	}
+
+	r = read_message(servicefd, &msg.start_rsp.h, sizeof(msg));	
+	if (r < 0) {
+		return r;
+	}
+	if (msg.start_rsp.h.type == BT_ERROR) {
+		fprintf(stderr, "Failed to start streaming from device %s\n", obj);
+		return -1;
+	}
+	printf("Stopped streaming from device %s\n", obj);
+	return 0;
+}
+
+/*static const char digital_milliwatt[] = {0x1e,0x0b,0x0b,0x1e,0x9e,0x8b,0x8b,0x9e} ;*/
+void run_sco_service(char *devname)
+{
+	union {
+		bt_audio_msg_header_t h;
+		bt_audio_error_t error;
+		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
+	} msg;
+	uint8_t pcmbuf[SCO_PCM_MTU];
+	struct pollfd svcpoll[2];
+	int rc = 0;
+	int audiostopped = 0;
+	int pcmsock = 0;
+	int svcsock = globals.audio_service_fd;
+
+	if (print_caps(svcsock, devname)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not get capabilities for device %s\n", devname);
+		return;
+	}
+
+	if (open_device(svcsock, devname)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not open audio service for device %s\n", devname);
+		return;
+	}
+
+	if ((pcmsock = start_stream(svcsock, devname)) < 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not start audio service for device %s\n", devname);
+		return;
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Audio socket is %d\n", pcmsock);
+
+	svcpoll[0].fd = svcsock;
+	svcpoll[0].events = POLLIN | POLLERR;
+	svcpoll[1].fd = pcmsock;
+	svcpoll[1].events = POLLIN | POLLERR;
+	audiostopped = 0;
+	for ( ; ; ) {
+
+		svcpoll[0].revents = 0;
+		svcpoll[1].revents = 0;
+
+		rc = poll(svcpoll, 2, -1);
+		if (rc < 0) {
+			if (errno == EINTR) {
+				break;
+			}
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error polling audio connection: %s\n", strerror(errno));
+			break;
+		}
+
+		if ((svcpoll[0].revents & POLLERR)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "POLLERR in service connection\n");
+			break;
+		}
+
+		if ((svcpoll[1].revents & POLLERR)) {
+			audiostopped = 1;
+			close(pcmsock);
+			pcmsock = -1;
+			break;
+		}
+
+		if ((svcpoll[0].revents & POLLIN)) {
+			rc = read_message(svcsock, &msg.h, sizeof(msg));
+			if (rc < 0) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to read bluez audio service message\n");
+				break;
+			}
+		}
+
+		if ((svcpoll[1].revents & POLLIN)) {
+			rc = read(pcmsock, pcmbuf, sizeof(pcmbuf));
+			if (rc < 0) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error reading from audio connection: %s\n", strerror(errno));
+				break;
+			}
+			if (rc != sizeof(pcmbuf)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Short read from audio connection (%d bytes)\n", rc);
+			}
+			rc = write(pcmsock, pcmbuf, rc);
+			if (rc < 0) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error writing to audio connection: %s\n", strerror(errno));
+				break;
+			}
+			if (rc != sizeof(pcmbuf)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Short write to audio connection (%d bytes)\n", rc);
+			}
+		}
+	}
+
+	stop_stream(svcsock, devname);
+
+}
 
 
 static void tech_init(private_t *tech_pvt, switch_core_session_t *session)
@@ -663,35 +1147,6 @@ static void load_modems(void)
 	switch_core_hash_init(&globals.modems, globals.module_pool);
 }
 
-#define HANDS_FREE_SYNTAX "handsfree list"
-SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
-{
-	switch_api_interface_t *commands_api_interface;
-	
-	memset(&globals, 0, sizeof(globals));
-
-	globals.module_pool = pool;
-
-	load_config();
-
-	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
-	handsfree_endpoint_interface = switch_loadable_module_create_interface(*module_interface, SWITCH_ENDPOINT_INTERFACE);
-	handsfree_endpoint_interface->interface_name = "handsfree";
-	handsfree_endpoint_interface->io_routines = &handsfree_io_routines;
-	handsfree_endpoint_interface->state_handler = &handsfree_state_handlers;
-
-	SWITCH_ADD_API(commands_api_interface, "handsfree", "Hands Free Endpoint Commands", handsf_function, HANDS_FREE_SYNTAX);
-
-	switch_console_set_complete("add handsfree list");
-
-	/* populate modems hash */
-	load_modems();
-
-	/* indicate that the module should continue to be loaded */
-	globals.running = 1;
-	return SWITCH_STATUS_SUCCESS;
-}
-
 static char *skip_sender(const char *event)
 {
 	char *str = strchr(event, '}');
@@ -742,6 +1197,45 @@ static char *get_modem_name_from_event(const char *event, char *modem_name, int 
 	return NULL;
 }
 
+typedef struct ofono_modem {
+	char name[MODEM_NAME_LEN];
+	int audiosock;
+	uint8_t pcm_write_buf[SCO_PCM_MTU * 10];
+	int write_in_use;
+	uint8_t pcm_read_buf[SCO_PCM_MTU * 10];
+	int read_in_use;
+} ofono_modem_t;
+
+static void handle_incoming_call(const char *modem_name)
+{
+	switch_channel_t *channel = NULL;
+	switch_core_session_t *session = NULL;
+	ofono_modem_t *modem = NULL;
+
+	modem = switch_core_hash_find(globals.modems, modem_name);
+	if (!modem) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Incoming call in unknwon modem %s\n", modem_name);
+		return;
+	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Incoming call in modem %s\n", modem_name);
+
+	/* notify FreeSWITCH about the incoming call */
+	if (!(session = switch_core_session_request(handsfree_endpoint_interface, SWITCH_CALL_DIRECTION_INBOUND, SOF_NONE, NULL))) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Session init Error!\n");
+		return;
+	}
+
+	switch_core_session_add_stream(session, NULL);
+
+	channel = switch_core_session_get_channel(session);
+	if (modem_init(modem, session) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Failed to initialize modem!\n");
+		switch_core_session_destroy(&session);
+		return;
+	}
+
+}
+
 #define VCM_NEW_CALL_EVENT "CallAdded"
 #define VCM_HANGUP_CALL_EVENT "CallRemoved"
 // Bluez device syntax: /org/bluez/26745/hci0/dev_00_1D_28_4B_9A_A8
@@ -766,7 +1260,7 @@ static void handle_call_manager_event(const char *event)
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem name from incoming call event %s\n", event);
 			return;
 		}
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Incoming call in modem %s\n", modem_name);
+		handle_incoming_call(modem_name);
 	} else if (strstr(event_str, VCM_HANGUP_CALL_EVENT)) {
 		modem_str = get_modem_name_from_event(event, modem_name, sizeof(modem_name));
 		if (!modem_str) {
@@ -910,29 +1404,84 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 			}
 		}
 	}
+
 	close(tofs[0]);
 	close(tofs[1]);
 	close(fromfs[0]);
 	close(fromfs[1]);
+
 	kill(pid, SIGTERM);
 	waitpid(pid, NULL, 0);
+
 	globals.thread_running = 0;
 	return SWITCH_STATUS_TERM;
 }
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown)
 {
+	/* stop threads  */
+	globals.running = 0;
+
 	/* Free dynamically allocated strings */
 	switch_safe_free(globals.codec_string);
 	switch_safe_free(globals.codec_rates_string);
-	globals.running = 0;
+
 	while (globals.thread_running) {
 		switch_yield(100000);
 	}
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Handsfree Done!\n");
+
+	/* close all audio connections to the devices */
+	close_device(globals.audio_service_fd, NULL);
+
+	bt_audio_service_close(globals.audio_service_fd);
+
 	switch_core_hash_destroy(&globals.modems);
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Handsfree Done!\n");
 	return SWITCH_STATUS_SUCCESS;
 }
+
+#define HANDS_FREE_SYNTAX "handsfree list"
+SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
+{
+	switch_api_interface_t *commands_api_interface;
+	
+	memset(&globals, 0, sizeof(globals));
+
+	globals.module_pool = pool;
+
+	/* read config */
+	load_config();
+
+	/* populate modems hash */
+	load_modems();
+
+	/* connect to the audio service*/
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Openning connection to bluez audio service at %s\n", BT_IPC_SOCKET_NAME);
+
+	globals.audio_service_fd = bt_audio_service_open();
+	if (globals.audio_service_fd < 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "connection to bluez audio service failed\n");
+		return SWITCH_STATUS_FALSE;
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Connected to the bluez audio service successfully\n");
+
+	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
+	handsfree_endpoint_interface = switch_loadable_module_create_interface(*module_interface, SWITCH_ENDPOINT_INTERFACE);
+	handsfree_endpoint_interface->interface_name = "handsfree";
+	handsfree_endpoint_interface->io_routines = &handsfree_io_routines;
+	handsfree_endpoint_interface->state_handler = &handsfree_state_handlers;
+
+	SWITCH_ADD_API(commands_api_interface, "handsfree", "Hands Free Endpoint Commands", handsf_function, HANDS_FREE_SYNTAX);
+
+	switch_console_set_complete("add handsfree list");
+
+	/* indicate that the module should continue to be loaded */
+	globals.running = 1;
+	return SWITCH_STATUS_SUCCESS;
+}
+
 
 /* For Emacs:
  * Local Variables:
