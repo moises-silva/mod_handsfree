@@ -55,6 +55,8 @@ static struct {
 	uint8_t debug;
 	volatile uint8_t running;
 	volatile uint8_t thread_running;
+	switch_hash_t *modems;
+	switch_memory_pool_t *module_pool;
 } globals;
 
 typedef enum {
@@ -70,7 +72,6 @@ typedef enum {
 } TFLAGS;
 
 switch_endpoint_interface_t *handsfree_endpoint_interface;
-static switch_memory_pool_t *module_pool = NULL;
 struct private_object {
 	unsigned int flags;
 	switch_codec_t read_codec;
@@ -482,8 +483,7 @@ static switch_status_t load_config(void)
 	char *cf = "handsfree.conf";
 	switch_xml_t cfg, xml, settings, param;
 
-	memset(&globals, 0, sizeof(globals));
-	switch_mutex_init(&globals.mutex, SWITCH_MUTEX_NESTED, module_pool);
+	switch_mutex_init(&globals.mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
 	if (!(xml = switch_xml_open_cfg(cf, &cfg, NULL))) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Open of %s failed\n", cf);
 		return SWITCH_STATUS_TERM;
@@ -651,13 +651,19 @@ end:
 	return SWITCH_STATUS_SUCCESS;
 }
 
+static void load_modems(void)
+{
+	switch_core_hash_init(&globals.modems, globals.module_pool);
+}
+
 #define HANDS_FREE_SYNTAX "handsfree list"
 SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 {
 	switch_api_interface_t *commands_api_interface;
-	module_pool = pool;
-
+	
 	memset(&globals, 0, sizeof(globals));
+
+	globals.module_pool = pool;
 
 	load_config();
 
@@ -671,9 +677,120 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 
 	switch_console_set_complete("add handsfree list");
 
+	/* populate modems hash */
+	load_modems();
+
 	/* indicate that the module should continue to be loaded */
 	globals.running = 1;
 	return SWITCH_STATUS_SUCCESS;
+}
+
+#define EVENT_NAME_LEN 255
+#define MODEM_NAME_LEN 255
+#define EVENT_SRC_VOICE_CALL_MANAGER "{VoiceCallManager}"
+#define EVENT_SRC_VOICE_CALL "{VoiceCall}"
+
+static char *skip_sender(const char *event)
+{
+	char *str = strchr(event, '}');
+	if (!str) {
+		return NULL;
+	}
+	str++;
+	if (!*str) {
+		return NULL;
+	}
+	str++;
+	if (!*str) {
+		return NULL;
+	}
+	return str;
+}
+
+/* searching for pattern ..../hfp/<modem-name>/.... */
+static char *get_modem_name_from_event(const char *event, char *modem_name, int modem_name_len)
+{
+	long len = 0;
+	const char *end = NULL;
+	const char *str = event;
+	if (!event) {
+		return NULL;
+	}
+	while (strlen(str) > 5) {
+		if (*str == '/' 
+	         && *(str + 1) == 'h' 
+		 && *(str + 2) == 'f' 
+		 && *(str + 3) == 'p'
+		 && *(str + 4) == '/') {
+			str += 5;
+			end = strchr(str, '/');
+			if (!end || end == str) {
+				return NULL;
+			}
+			len = (long)end - (long)str;
+			if (len >= modem_name_len) {
+				return NULL;
+			}
+			memcpy(modem_name, str, len);
+			modem_name[modem_name_len-1] = 0;
+			return modem_name;
+		}
+		str++;
+	}
+	return NULL;
+}
+
+#define VCM_NEW_CALL_EVENT "[CallAdded]"
+// Bluez device syntax: /org/bluez/26745/hci0/dev_00_1D_28_4B_9A_A8
+// where does 26745 comes from? seems like a PID, where to get it from?
+// hci0 is the adapter, this needs to come from configuration
+// {VoiceCallManager} [CallAdded] /hfp/00158315A310_001D284B9AA8/voicecall01 { State = incoming, LineIdentification = +16478353016, Multiparty = False }
+static void handle_call_manager_event(const char *event)
+{
+	char *event_str = NULL;
+	char modem_name[MODEM_NAME_LEN];
+	char *modem_str = NULL;
+
+	event_str = skip_sender(event);
+	if (!event_str) {
+		return;
+	}
+
+	/* handle the actual event for VoiceCallManager */
+	if (!strncasecmp(VCM_NEW_CALL_EVENT, event_str, sizeof(VCM_NEW_CALL_EVENT)-1)) {
+		modem_str = get_modem_name_from_event(event, modem_name, sizeof(modem_name));
+		if (!modem_str) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem name from incoming call event %s\n", event);
+			return;
+		}
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Incoming call in modem %s\n", modem_name);
+	} else {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignored VoiceCallManager event: %s\n", event_str);
+	}
+}
+
+static void handle_call_event(const char *event)
+{
+#if 0
+	const char *modem = get_modem_name_from_event(event);
+	if (!modem) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Failed to get modem from event: %s\n", event);
+		return;
+	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Event on modem %s\n", modem);
+#endif
+}
+
+static void process_event(const char *event)
+{
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s\n", event);
+	if (!strncasecmp(EVENT_SRC_VOICE_CALL_MANAGER, event, sizeof(EVENT_SRC_VOICE_CALL_MANAGER)-1)) {
+		handle_call_manager_event(event);
+	} else if (!strncasecmp(EVENT_SRC_VOICE_CALL, event, sizeof(EVENT_SRC_VOICE_CALL)-1)) {
+		handle_call_event(event);
+	} else {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignored unknown event: %s\n", event);
+	}
 }
 
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
@@ -756,7 +873,7 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 					if (c) {
 						*c = '\0';
 					}
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s\n", event);
+					process_event(event);
 					if (c) {
 						event = c;
 						event++;
@@ -793,6 +910,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown)
 		switch_yield(100000);
 	}
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Handsfree Done!\n");
+	switch_core_hash_destroy(&globals.modems);
 	return SWITCH_STATUS_SUCCESS;
 }
 
