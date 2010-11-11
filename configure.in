@@ -314,7 +314,6 @@ if test "${enable_debug}" = "yes"; then
         AC_DEFINE([DEBUG],[],[Enable extra debugging.])
 	saved_CFLAGS="$CFLAGS"
 	CFLAGS=
-        AX_CFLAGS_WARN_ALL_ANSI
 	SWITCH_ANSI_CFLAGS=$CFLAGS
 	CFLAGS="$saved_CFLAGS"	
 
