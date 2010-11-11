@@ -37,10 +37,17 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime);
 SWITCH_MODULE_DEFINITION(mod_handsfree, mod_handsfree_load, mod_handsfree_shutdown, mod_handsfree_runtime);
 
+#define EVENT_NAME_LEN 255
+#define MODEM_NAME_LEN 255
+#define EVENT_SRC_VOICE_CALL_MANAGER "{VoiceCallManager}"
+#define EVENT_SRC_VOICE_CALL "{VoiceCall}"
+#define EVENT_SRC_MODEM "{Modem}"
+#define EVENT_SRC_CALL_VOL "{CallVolume}"
+#define EVENT_SRC_NETWORK_REG "{NetworkRegistration}"
+
 typedef enum {
 	GFLAG_MY_CODEC_PREFS = (1 << 0)
 } GFLAGS;
-
 
 static struct {
 	char *codec_string;
@@ -685,11 +692,6 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-#define EVENT_NAME_LEN 255
-#define MODEM_NAME_LEN 255
-#define EVENT_SRC_VOICE_CALL_MANAGER "{VoiceCallManager}"
-#define EVENT_SRC_VOICE_CALL "{VoiceCall}"
-
 static char *skip_sender(const char *event)
 {
 	char *str = strchr(event, '}');
@@ -740,7 +742,8 @@ static char *get_modem_name_from_event(const char *event, char *modem_name, int 
 	return NULL;
 }
 
-#define VCM_NEW_CALL_EVENT "[CallAdded]"
+#define VCM_NEW_CALL_EVENT "CallAdded"
+#define VCM_HANGUP_CALL_EVENT "CallRemoved"
 // Bluez device syntax: /org/bluez/26745/hci0/dev_00_1D_28_4B_9A_A8
 // where does 26745 comes from? seems like a PID, where to get it from?
 // hci0 is the adapter, this needs to come from configuration
@@ -757,13 +760,20 @@ static void handle_call_manager_event(const char *event)
 	}
 
 	/* handle the actual event for VoiceCallManager */
-	if (!strncasecmp(VCM_NEW_CALL_EVENT, event_str, sizeof(VCM_NEW_CALL_EVENT)-1)) {
+	if (strstr(event_str, VCM_NEW_CALL_EVENT)) {
 		modem_str = get_modem_name_from_event(event, modem_name, sizeof(modem_name));
 		if (!modem_str) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem name from incoming call event %s\n", event);
 			return;
 		}
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Incoming call in modem %s\n", modem_name);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Incoming call in modem %s\n", modem_name);
+	} else if (strstr(event_str, VCM_HANGUP_CALL_EVENT)) {
+		modem_str = get_modem_name_from_event(event, modem_name, sizeof(modem_name));
+		if (!modem_str) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem name from hangup call event %s\n", event);
+			return;
+		}
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Hangup call in modem %s\n", modem_name);
 	} else {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignored VoiceCallManager event: %s\n", event_str);
 	}
@@ -771,14 +781,18 @@ static void handle_call_manager_event(const char *event)
 
 static void handle_call_event(const char *event)
 {
-#if 0
-	const char *modem = get_modem_name_from_event(event);
-	if (!modem) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Failed to get modem from event: %s\n", event);
-		return;
-	}
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Event on modem %s\n", modem);
-#endif
+}
+
+static void handle_modem_event(const char *event)
+{
+}
+
+static void handle_call_vol_event(const char *event)
+{
+}
+
+static void handle_network_reg_event(const char *event)
+{
 }
 
 static void process_event(const char *event)
@@ -788,6 +802,12 @@ static void process_event(const char *event)
 		handle_call_manager_event(event);
 	} else if (!strncasecmp(EVENT_SRC_VOICE_CALL, event, sizeof(EVENT_SRC_VOICE_CALL)-1)) {
 		handle_call_event(event);
+	} else if (!strncasecmp(EVENT_SRC_MODEM, event, sizeof(EVENT_SRC_MODEM)-1)) {
+		handle_modem_event(event);
+	} else if (!strncasecmp(EVENT_SRC_CALL_VOL, event, sizeof(EVENT_SRC_CALL_VOL)-1)) {
+		handle_call_vol_event(event);
+	} else if (!strncasecmp(EVENT_SRC_NETWORK_REG, event, sizeof(EVENT_SRC_NETWORK_REG)-1)) {
+		handle_network_reg_event(event);
 	} else {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignored unknown event: %s\n", event);
 	}
