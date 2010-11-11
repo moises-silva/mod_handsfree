@@ -1,0 +1,3 @@
+- enable all modems present in the handsfree XML configuration on startup.
+- each time a new modem is detected, check if is listed in the XML configuration and enable it if that is the case.
+
