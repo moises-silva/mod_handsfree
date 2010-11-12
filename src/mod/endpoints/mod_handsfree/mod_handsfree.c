@@ -43,6 +43,7 @@ SWITCH_MODULE_DEFINITION(mod_handsfree, mod_handsfree_load, mod_handsfree_shutdo
 
 #define EVENT_NAME_LEN 255
 #define MODEM_NAME_LEN 255
+#define MODEM_ID_LEN 255
 #define EVENT_SRC_VOICE_CALL_MANAGER "{VoiceCallManager}"
 #define EVENT_SRC_VOICE_CALL "{VoiceCall}"
 #define EVENT_SRC_MODEM "{Modem}"
@@ -52,24 +53,6 @@ SWITCH_MODULE_DEFINITION(mod_handsfree, mod_handsfree_load, mod_handsfree_shutdo
 typedef enum {
 	GFLAG_MY_CODEC_PREFS = (1 << 0)
 } GFLAGS;
-
-static struct {
-	char *codec_string;
-	char *codec_order[SWITCH_MAX_CODECS];
-	int codec_order_last;
-	char *codec_rates_string;
-	char *codec_rates[SWITCH_MAX_CODECS];
-	int codec_rates_last;
-	unsigned int flags;
-	int calls;
-	switch_mutex_t *mutex;
-	uint8_t debug;
-	volatile uint8_t running;
-	volatile uint8_t thread_running;
-	switch_hash_t *modems;
-	switch_memory_pool_t *module_pool;
-	int audio_service_fd;
-} globals;
 
 typedef enum {
 	TFLAG_IO = (1 << 0),
@@ -91,6 +74,7 @@ switch_endpoint_interface_t *handsfree_endpoint_interface;
 #define MODEM_RATE 8000
 #define MODEM_INTERVAL 20
 typedef struct ofono_modem {
+	char id[MODEM_ID_LEN];
 	char name[MODEM_NAME_LEN];
 
 	/* audio connection to bluez */
@@ -115,7 +99,24 @@ typedef struct ofono_modem {
 
 	int32_t flags;
 	switch_mutex_t *flag_mutex;
+
+	char dialplan[255];
+	char context[255];
 } ofono_modem_t;
+
+static struct {
+	unsigned int flags;
+	int calls;
+	switch_mutex_t *mutex;
+	volatile uint8_t running;
+	volatile uint8_t thread_running;
+	switch_hash_t *modems;
+	switch_memory_pool_t *module_pool;
+	int audio_service_fd;
+	char dialplan[255];
+	char context[255];
+	ofono_modem_t modems_array[50];
+} globals;
 
 static switch_status_t channel_on_init(switch_core_session_t *session);
 static switch_status_t channel_on_hangup(switch_core_session_t *session);
@@ -1002,9 +1003,9 @@ switch_io_routines_t handsfree_io_routines = {
 static switch_status_t load_config(void)
 {
 	char *cf = "handsfree.conf";
-	switch_xml_t cfg, xml, settings, param;
+	int modem_i = 0;
+	switch_xml_t cfg, xml, settings, param, modems, mymodem;
 
-	switch_mutex_init(&globals.mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
 	if (!(xml = switch_xml_open_cfg(cf, &cfg, NULL))) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Open of %s failed\n", cf);
 		return SWITCH_STATUS_TERM;
@@ -1014,9 +1015,54 @@ static switch_status_t load_config(void)
 		for (param = switch_xml_child(settings, "param"); param; param = param->next) {
 			char *var = (char *) switch_xml_attr_soft(param, "name");
 			char *val = (char *) switch_xml_attr_soft(param, "value");
+			if (!strcasecmp(var, "dialplan")) {
+				strcpy(globals.dialplan, val);
+			}
+			else if (!strcasecmp(var, "context")) {
+				strcpy(globals.context, val);
+			}
+		}
+	}
 
-			if (!strcmp(var, "debug")) {
-				globals.debug = atoi(val);
+	if ((modems = switch_xml_child(cfg, "modems"))) {
+		for (mymodem = switch_xml_child(modems, "modem"); mymodem; mymodem = mymodem->next) {
+			ofono_modem_t *modem = &globals.modems_array[modem_i];
+			char *modem_id = (char *)switch_xml_attr_soft(mymodem, "id");
+
+			if (!modem_id) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignoring modem entry without id attribute\n");
+				continue;
+			}
+
+			switch_core_hash_insert(globals.modems, modem_id, modem);
+
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Added modem '%s'\n", modem_id);
+
+			switch_mutex_init(&modem->mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
+			snprintf(modem->id, sizeof(modem->id), "%s", modem_id);
+			snprintf(modem->name, sizeof(modem->name), "%s", modem_id);
+			snprintf(modem->dialplan, sizeof(modem->dialplan), "%s", "XML");
+			snprintf(modem->context, sizeof(modem->context), "%s", "public");
+
+			for (param = switch_xml_child(settings, "param"); param; param = param->next) {
+				char *var = (char *) switch_xml_attr_soft(param, "name");
+				char *val = (char *) switch_xml_attr_soft(param, "value");
+				if (!strcasecmp(var, "dialplan")) {
+					snprintf(modem->dialplan, sizeof(modem->dialplan), "%s", val);
+				}
+				else if (!strcasecmp(var, "context")) {
+					snprintf(modem->context, sizeof(modem->context), "%s", val);
+				} 
+				else if (!strcasecmp(var, "name")) {
+					snprintf(modem->name, sizeof(modem->name), "%s", modem_id);
+				}
+			}
+
+			modem_i++;
+			if (modem_i == switch_arraylen(globals.modems_array)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Maximum number of modems reached, "
+						"not processing more modem entries in configuration!\n");
+				break;
 			}
 		}
 	}
@@ -1174,7 +1220,6 @@ end:
 
 static void load_modems(void)
 {
-	switch_core_hash_init(&globals.modems, globals.module_pool);
 }
 
 static char *skip_sender(const char *event)
@@ -1195,12 +1240,12 @@ static char *skip_sender(const char *event)
 }
 
 /* searching for pattern ..../hfp/<modem-name>/.... */
-static char *get_modem_name_from_event(const char *event, char *modem_name, int modem_name_len)
+static char *get_modem_name_from_line(const char *line, char *modem_name, int modem_name_len)
 {
 	long len = 0;
 	const char *end = NULL;
-	const char *str = event;
-	if (!event) {
+	const char *str = line;
+	if (!line) {
 		return NULL;
 	}
 	while (strlen(str) > 5) {
@@ -1219,6 +1264,7 @@ static char *get_modem_name_from_event(const char *event, char *modem_name, int 
 				return NULL;
 			}
 			memcpy(modem_name, str, len);
+			modem_name[len] = 0;
 			modem_name[modem_name_len-1] = 0;
 			return modem_name;
 		}
@@ -1236,7 +1282,7 @@ static void handle_incoming_call(const char *modem_name)
 
 	modem = switch_core_hash_find(globals.modems, modem_name);
 	if (!modem) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Incoming call in unknwon modem %s\n", modem_name);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Incoming call in unknown modem '%s'\n", modem_name);
 		return;
 	}
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Incoming call in modem %s\n", modem_name);
@@ -1307,14 +1353,14 @@ static void handle_call_manager_event(const char *event)
 
 	/* handle the actual event for VoiceCallManager */
 	if (strstr(event_str, VCM_NEW_CALL_EVENT)) {
-		modem_str = get_modem_name_from_event(event, modem_name, sizeof(modem_name));
+		modem_str = get_modem_name_from_line(event, modem_name, sizeof(modem_name));
 		if (!modem_str) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem name from incoming call event %s\n", event);
 			return;
 		}
 		handle_incoming_call(modem_name);
 	} else if (strstr(event_str, VCM_HANGUP_CALL_EVENT)) {
-		modem_str = get_modem_name_from_event(event, modem_name, sizeof(modem_name));
+		modem_str = get_modem_name_from_line(event, modem_name, sizeof(modem_name));
 		if (!modem_str) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem name from hangup call event %s\n", event);
 			return;
@@ -1474,10 +1520,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown)
 	/* stop threads  */
 	globals.running = 0;
 
-	/* Free dynamically allocated strings */
-	switch_safe_free(globals.codec_string);
-	switch_safe_free(globals.codec_rates_string);
-
+	/* Wait monitor thread to exit */
 	while (globals.thread_running) {
 		switch_yield(100000);
 	}
@@ -1502,10 +1545,14 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 
 	globals.module_pool = pool;
 
+	switch_mutex_init(&globals.mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
+
+	switch_core_hash_init(&globals.modems, globals.module_pool);
+
 	/* read config */
 	load_config();
 
-	/* populate modems hash */
+	/* update modems hash with real time information */
 	load_modems();
 
 	/* connect to the audio service*/
@@ -1534,6 +1581,139 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 	return SWITCH_STATUS_SUCCESS;
 }
 
+
+
+/*
+ *
+ *  BlueZ - Bluetooth protocol stack for Linux
+ *
+ *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *
+ *  This library is free software; you can redistribute it and/or
+ *  modify it under the terms of the GNU Lesser General Public
+ *  License as published by the Free Software Foundation; either
+ *  version 2.1 of the License, or (at your option) any later version.
+ *
+ *  This library is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *  Lesser General Public License for more details.
+ *
+ *  You should have received a copy of the GNU Lesser General Public
+ *  License along with this library; if not, write to the Free Software
+ *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ *
+ */
+
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+
+/* This table contains the string representation for messages types */
+static const char *strtypes[] = {
+	"BT_REQUEST",
+	"BT_RESPONSE",
+	"BT_INDICATION",
+	"BT_ERROR",
+};
+
+/* This table contains the string representation for messages names */
+static const char *strnames[] = {
+	"BT_GET_CAPABILITIES",
+	"BT_OPEN",
+	"BT_SET_CONFIGURATION",
+	"BT_NEW_STREAM",
+	"BT_START_STREAM",
+	"BT_STOP_STREAM",
+	"BT_CLOSE",
+	"BT_CONTROL",
+	"BT_DELAY_REPORT",
+};
+
+int bt_audio_service_open(void)
+{
+	int sk;
+	int err;
+	struct sockaddr_un addr = {
+		AF_UNIX, BT_IPC_SOCKET_NAME
+	};
+
+	sk = socket(PF_LOCAL, SOCK_STREAM, 0);
+	if (sk < 0) {
+		err = errno;
+		fprintf(stderr, "%s: Cannot open socket: %s (%d)\n",
+			__FUNCTION__, strerror(err), err);
+		errno = err;
+		return -1;
+	}
+
+	if (connect(sk, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+		err = errno;
+		fprintf(stderr, "%s: connect() failed: %s (%d)\n",
+			__FUNCTION__, strerror(err), err);
+		close(sk);
+		errno = err;
+		return -1;
+	}
+
+	return sk;
+}
+
+int bt_audio_service_close(int sk)
+{
+	return close(sk);
+}
+
+int bt_audio_service_get_data_fd(int sk)
+{
+	char cmsg_b[CMSG_SPACE(sizeof(int))], m;
+	int err, ret;
+	struct iovec iov = { &m, sizeof(m) };
+	struct msghdr msgh;
+	struct cmsghdr *cmsg;
+
+	memset(&msgh, 0, sizeof(msgh));
+	msgh.msg_iov = &iov;
+	msgh.msg_iovlen = 1;
+	msgh.msg_control = &cmsg_b;
+	msgh.msg_controllen = CMSG_LEN(sizeof(int));
+
+	ret = recvmsg(sk, &msgh, 0);
+	if (ret < 0) {
+		err = errno;
+		fprintf(stderr, "%s: Unable to receive fd: %s (%d)\n",
+			__FUNCTION__, strerror(err), err);
+		errno = err;
+		return -1;
+	}
+
+	/* Receive auxiliary data in msgh */
+	for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg != NULL;
+			cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+		if (cmsg->cmsg_level == SOL_SOCKET
+				&& cmsg->cmsg_type == SCM_RIGHTS) {
+			memcpy(&ret, CMSG_DATA(cmsg), sizeof(int));
+			return ret;
+		}
+	}
+
+	errno = EINVAL;
+	return -1;
+}
+
+const char *bt_audio_strtype(uint8_t type)
+{
+	if (type >= ARRAY_SIZE(strtypes))
+		return NULL;
+
+	return strtypes[type];
+}
+
+const char *bt_audio_strname(uint8_t name)
+{
+	if (name >= ARRAY_SIZE(strnames))
+		return NULL;
+
+	return strnames[name];
+}
 
 /* For Emacs:
  * Local Variables:
