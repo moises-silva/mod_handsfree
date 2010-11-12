@@ -1,0 +1,22 @@
+<configuration name="handsfree.conf" description="Handsfree Endpoint">
+
+  <settings>
+    <!--Default dialplan -->
+    <param name="dialplan" value="XML"/>
+    <param name="context" value="default"/>
+  </settings>
+
+  <!-- which modems to register -->
+  <modems>
+  	<!-- id is the numerical part of the modem name as listed by handsfree list (list-modems script) -->
+  	<modem id="00158315A310_001D284B9AA8">
+  		<!-- optional friendly name (if not set, the bluetooth device friendly name will be used) -->
+    		<param name="name" value="sony-ericson-1"/>
+  		<!-- where to send the incoming calls to -->
+    		<param name="dialplan" value="XML"/>
+    		<param name="context" value="default"/>
+	</modem>
+  </modems>
+
+</configuration>
+
