@@ -84,19 +84,38 @@ typedef enum {
 } TFLAGS;
 
 switch_endpoint_interface_t *handsfree_endpoint_interface;
-struct private_object {
-	unsigned int flags;
-	switch_codec_t read_codec;
-	switch_codec_t write_codec;
-	switch_frame_t read_frame;
+
+/* SCO connections work with 48 byte-sized frames only */
+#define SCO_PCM_MTU 48
+
+#define MODEM_RATE 8000
+#define MODEM_INTERVAL 20
+typedef struct ofono_modem {
+	char name[MODEM_NAME_LEN];
+
+	/* audio connection to bluez */
+	int audiosock;
+
+	uint8_t pcm_write_buf[SCO_PCM_MTU * 10];
+	int write_in_use;
+	int writecnt;
+
+	uint8_t pcm_read_buf[SCO_PCM_MTU * 10];
+	int read_in_use;
+	int readcnt;
+
 	unsigned char databuf[SWITCH_RECOMMENDED_BUFFER_SIZE];
 	switch_core_session_t *session;
 	switch_caller_profile_t *caller_profile;
 	switch_mutex_t *mutex;
-	switch_mutex_t *flag_mutex;
-};
 
-typedef struct private_object private_t;
+	switch_codec_t read_codec;
+	switch_codec_t write_codec;
+	switch_frame_t read_frame;
+
+	int32_t flags;
+	switch_mutex_t *flag_mutex;
+} ofono_modem_t;
 
 static switch_status_t channel_on_init(switch_core_session_t *session);
 static switch_status_t channel_on_hangup(switch_core_session_t *session);
@@ -113,9 +132,6 @@ static switch_status_t channel_write_frame(switch_core_session_t *session, switc
 static switch_status_t channel_kill_channel(switch_core_session_t *session, int sig);
 
 /** SCO audio stuff **/
-
-/* SCO connections work with 48 byte-sized frames only */
-#define SCO_PCM_MTU 48
 
 static int loop_read(int sock, char *buf, ssize_t len)
 {
@@ -592,16 +608,6 @@ void run_sco_service(char *devname)
 }
 
 
-static void tech_init(private_t *tech_pvt, switch_core_session_t *session)
-{
-	tech_pvt->read_frame.data = tech_pvt->databuf;
-	tech_pvt->read_frame.buflen = sizeof(tech_pvt->databuf);
-	switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
-	switch_mutex_init(&tech_pvt->flag_mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
-	switch_core_session_set_private(session, tech_pvt);
-	tech_pvt->session = session;
-}
-
 /* 
    State methods they get called when the state changes to the specific state 
    returning SWITCH_STATUS_SUCCESS tells the core to execute the standard state method next
@@ -610,14 +616,15 @@ static void tech_init(private_t *tech_pvt, switch_core_session_t *session)
 static switch_status_t channel_on_init(switch_core_session_t *session)
 {
 	switch_channel_t *channel;
-	private_t *tech_pvt = NULL;
+	ofono_modem_t *modem = NULL;
 
-	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	modem = switch_core_session_get_private(session);
+	switch_assert(modem != NULL);
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
-	switch_set_flag_locked(tech_pvt, TFLAG_IO);
+	switch_assert(channel != NULL);
+
+	switch_set_flag_locked(modem, TFLAG_IO);
 
 	/* Move channel's state machine to ROUTING. This means the call is trying
 	   to get from the initial start where the call because, to the point
@@ -634,13 +641,13 @@ static switch_status_t channel_on_init(switch_core_session_t *session)
 static switch_status_t channel_on_routing(switch_core_session_t *session)
 {
 	switch_channel_t *channel = NULL;
-	private_t *tech_pvt = NULL;
+	ofono_modem_t *modem = NULL;
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
-	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	modem = switch_core_session_get_private(session);
+	switch_assert(modem != NULL);
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "%s CHANNEL ROUTING\n", switch_channel_get_name(channel));
 
@@ -651,16 +658,15 @@ static switch_status_t channel_on_execute(switch_core_session_t *session)
 {
 
 	switch_channel_t *channel = NULL;
-	private_t *tech_pvt = NULL;
+	ofono_modem_t *modem = NULL;
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
-	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	modem = switch_core_session_get_private(session);
+	switch_assert(modem != NULL);
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "%s CHANNEL EXECUTE\n", switch_channel_get_name(channel));
-
 
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -668,23 +674,22 @@ static switch_status_t channel_on_execute(switch_core_session_t *session)
 static switch_status_t channel_on_destroy(switch_core_session_t *session)
 {
 	switch_channel_t *channel = NULL;
-	private_t *tech_pvt = NULL;
+	ofono_modem_t *modem = NULL;
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
-	tech_pvt = switch_core_session_get_private(session);
+	modem = switch_core_session_get_private(session);
 
-	if (tech_pvt) {
-		if (switch_core_codec_ready(&tech_pvt->read_codec)) {
-			switch_core_codec_destroy(&tech_pvt->read_codec);
+	if (modem) {
+		if (switch_core_codec_ready(&modem->read_codec)) {
+			switch_core_codec_destroy(&modem->read_codec);
 		}
 
-		if (switch_core_codec_ready(&tech_pvt->write_codec)) {
-			switch_core_codec_destroy(&tech_pvt->write_codec);
+		if (switch_core_codec_ready(&modem->write_codec)) {
+			switch_core_codec_destroy(&modem->write_codec);
 		}
 	}
-
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -692,16 +697,16 @@ static switch_status_t channel_on_destroy(switch_core_session_t *session)
 static switch_status_t channel_on_hangup(switch_core_session_t *session)
 {
 	switch_channel_t *channel = NULL;
-	private_t *tech_pvt = NULL;
+	ofono_modem_t *modem = NULL;
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
-	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	modem = switch_core_session_get_private(session);
+	switch_assert(modem != NULL);
 
-	switch_clear_flag_locked(tech_pvt, TFLAG_IO);
-	switch_clear_flag_locked(tech_pvt, TFLAG_VOICE);
+	switch_clear_flag_locked(modem, TFLAG_IO);
+	switch_clear_flag_locked(modem, TFLAG_VOICE);
 
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "%s CHANNEL HANGUP\n", switch_channel_get_name(channel));
@@ -718,13 +723,13 @@ static switch_status_t channel_on_hangup(switch_core_session_t *session)
 static switch_status_t channel_kill_channel(switch_core_session_t *session, int sig)
 {
 	switch_channel_t *channel = NULL;
-	private_t *tech_pvt = NULL;
+	ofono_modem_t *modem = NULL;
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
-	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	modem = switch_core_session_get_private(session);
+	switch_assert(modem != NULL);
 
 	switch (sig) {
 	case SWITCH_SIG_KILL:
@@ -753,8 +758,8 @@ static switch_status_t channel_on_soft_execute(switch_core_session_t *session)
 
 static switch_status_t channel_send_dtmf(switch_core_session_t *session, const switch_dtmf_t *dtmf)
 {
-	private_t *tech_pvt = switch_core_session_get_private(session);
-	switch_assert(tech_pvt != NULL);
+	ofono_modem_t *modem = switch_core_session_get_private(session);
+	switch_assert(modem != NULL);
 
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -762,55 +767,50 @@ static switch_status_t channel_send_dtmf(switch_core_session_t *session, const s
 static switch_status_t channel_read_frame(switch_core_session_t *session, switch_frame_t **frame, switch_io_flag_t flags, int stream_id)
 {
 	switch_channel_t *channel = NULL;
-	private_t *tech_pvt = NULL;
+	ofono_modem_t *modem = NULL;
 	switch_byte_t *data;
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
-	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
-	tech_pvt->read_frame.flags = SFF_NONE;
+	modem = switch_core_session_get_private(session);
+	switch_assert(modem != NULL);
+	modem->read_frame.flags = SFF_NONE;
 	*frame = NULL;
 
-	while (switch_test_flag(tech_pvt, TFLAG_IO)) {
+	modem->readcnt++;
+	while (switch_test_flag(modem, TFLAG_IO)) {
 
-		if (switch_test_flag(tech_pvt, TFLAG_BREAK)) {
-			switch_clear_flag(tech_pvt, TFLAG_BREAK);
+		if (switch_test_flag(modem, TFLAG_BREAK)) {
+			switch_clear_flag(modem, TFLAG_BREAK);
 			goto cng;
 		}
 
-		if (!switch_test_flag(tech_pvt, TFLAG_IO)) {
+		if (!switch_test_flag(modem, TFLAG_IO)) {
 			return SWITCH_STATUS_FALSE;
 		}
 
-		if (switch_test_flag(tech_pvt, TFLAG_IO) && switch_test_flag(tech_pvt, TFLAG_VOICE)) {
-			switch_clear_flag_locked(tech_pvt, TFLAG_VOICE);
-			if (!tech_pvt->read_frame.datalen) {
+		if (switch_test_flag(modem, TFLAG_IO) && switch_test_flag(modem, TFLAG_VOICE)) {
+			switch_clear_flag_locked(modem, TFLAG_VOICE);
+			if (!modem->read_frame.datalen) {
 				continue;
 			}
-			*frame = &tech_pvt->read_frame;
-#if SWITCH_BYTE_ORDER == __BIG_ENDIAN
-			if (switch_test_flag(tech_pvt, TFLAG_LINEAR)) {
-				switch_swap_linear((*frame)->data, (int) (*frame)->datalen / 2);
-			}
-#endif
+			*frame = &modem->read_frame;
 			return SWITCH_STATUS_SUCCESS;
 		}
-
 		switch_cond_next();
 	}
-
 
 	return SWITCH_STATUS_FALSE;
 
   cng:
-	data = (switch_byte_t *) tech_pvt->read_frame.data;
+	data = (switch_byte_t *) modem->read_frame.data;
 	data[0] = 65;
 	data[1] = 0;
-	tech_pvt->read_frame.datalen = 2;
-	tech_pvt->read_frame.flags = SFF_CNG;
-	*frame = &tech_pvt->read_frame;
+	modem->read_frame.datalen = 2;
+	modem->read_frame.flags = SFF_CNG;
+	*frame = &modem->read_frame;
+
 	return SWITCH_STATUS_SUCCESS;
 
 }
@@ -818,60 +818,41 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 static switch_status_t channel_write_frame(switch_core_session_t *session, switch_frame_t *frame, switch_io_flag_t flags, int stream_id)
 {
 	switch_channel_t *channel = NULL;
-	private_t *tech_pvt = NULL;
-	//switch_frame_t *pframe;
+	ofono_modem_t *modem = NULL;
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
-	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	modem = switch_core_session_get_private(session);
+	switch_assert(modem != NULL);
 
-	if (!switch_test_flag(tech_pvt, TFLAG_IO)) {
+	if (!switch_test_flag(modem, TFLAG_IO)) {
 		return SWITCH_STATUS_FALSE;
 	}
 #if SWITCH_BYTE_ORDER == __BIG_ENDIAN
-	if (switch_test_flag(tech_pvt, TFLAG_LINEAR)) {
+	if (switch_test_flag(modem, TFLAG_LINEAR)) {
 		switch_swap_linear(frame->data, (int) frame->datalen / 2);
 	}
 #endif
-
-
-	return SWITCH_STATUS_SUCCESS;
-
-}
-
-static switch_status_t channel_answer_channel(switch_core_session_t *session)
-{
-	private_t *tech_pvt;
-	switch_channel_t *channel = NULL;
-
-	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
-
-	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
-
-
+	modem->writecnt++;
 	return SWITCH_STATUS_SUCCESS;
 }
-
 
 static switch_status_t channel_receive_message(switch_core_session_t *session, switch_core_session_message_t *msg)
 {
 	switch_channel_t *channel;
-	private_t *tech_pvt;
+	ofono_modem_t *modem;
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
-	tech_pvt = (private_t *) switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	modem = switch_core_session_get_private(session);
+	switch_assert(modem != NULL);
 
 	switch (msg->message_id) {
 	case SWITCH_MESSAGE_INDICATE_ANSWER:
 		{
-			channel_answer_channel(session);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Answering modem %s\n", modem->name);
 		}
 		break;
 	default:
@@ -881,28 +862,76 @@ static switch_status_t channel_receive_message(switch_core_session_t *session, s
 	return SWITCH_STATUS_SUCCESS;
 }
 
+static switch_status_t modem_init(ofono_modem_t *modem, switch_core_session_t *session)
+{
+	switch_status_t status;
+
+	switch_mutex_lock(modem->mutex);
+
+	if (modem->session) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Modem %s already has a session!\n", modem->name);
+		goto err;
+	}
+
+
+	/* initialize the codec */
+	status = switch_core_codec_init(&modem->read_codec, "L16", NULL, 
+			MODEM_RATE, MODEM_INTERVAL, 
+			1, SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
+			NULL, switch_core_session_get_private(session));
+	if (status != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Modem %s failed to initialize its read codec!\n", modem->name);
+		goto err;
+	}
+
+	status = switch_core_codec_init(&modem->write_codec, "L16", NULL, 
+			MODEM_RATE, MODEM_INTERVAL, 
+			1, SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
+			NULL, switch_core_session_get_private(session));
+	if (status != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Modem %s failed to initialize its write codec!\n", modem->name);
+		switch_core_codec_destroy(&modem->read_codec);
+		goto err;
+	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Set codec L16 %dHz %dms\n", MODEM_RATE, MODEM_INTERVAL);
+	switch_core_session_set_read_codec(session, &modem->read_codec);
+	switch_core_session_set_write_codec(session, &modem->write_codec);
+
+	/* setup the read frame */
+	modem->read_frame.codec = &modem->read_codec;
+	modem->read_frame.data = modem->databuf;
+	modem->read_frame.buflen = sizeof(modem->databuf);
+
+	/* associate modem to session and viceversa */
+	modem->session = session;
+	switch_core_session_set_private(session, modem);
+
+	switch_mutex_unlock(modem->mutex);
+	return SWITCH_STATUS_SUCCESS;
+
+err:
+	switch_mutex_unlock(modem->mutex);
+	return SWITCH_STATUS_GENERR;
+
+}
+
+
 /* Make sure when you have 2 sessions in the same scope that you pass the appropriate one to the routines
    that allocate memory or you will have 1 channel with memory allocated from another channel's pool!
 */
 static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *session, switch_event_t *var_event,
-													switch_caller_profile_t *outbound_profile,
-													switch_core_session_t **new_session, switch_memory_pool_t **pool, switch_originate_flag_t flags,
-													switch_call_cause_t *cancel_cause)
+						switch_caller_profile_t *outbound_profile,
+						switch_core_session_t **new_session, switch_memory_pool_t **pool, switch_originate_flag_t flags,
+						switch_call_cause_t *cancel_cause)
 {
 	if ((*new_session = switch_core_session_request(handsfree_endpoint_interface, SWITCH_CALL_DIRECTION_OUTBOUND, flags, pool)) != 0) {
-		private_t *tech_pvt;
+		ofono_modem_t *modem;
 		switch_channel_t *channel;
 		switch_caller_profile_t *caller_profile;
 
 		switch_core_session_add_stream(*new_session, NULL);
-		if ((tech_pvt = (private_t *) switch_core_session_alloc(*new_session, sizeof(private_t))) != 0) {
-			channel = switch_core_session_get_channel(*new_session);
-			tech_init(tech_pvt, *new_session);
-		} else {
-			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(*new_session), SWITCH_LOG_CRIT, "Hey where is my memory pool?\n");
-			switch_core_session_destroy(new_session);
-			return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
-		}
+		channel = switch_core_session_get_channel(*new_session);
+		modem_init(modem, *new_session);
 
 		if (outbound_profile) {
 			char name[128];
@@ -912,7 +941,7 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 
 			caller_profile = switch_caller_profile_clone(*new_session, outbound_profile);
 			switch_channel_set_caller_profile(channel, caller_profile);
-			tech_pvt->caller_profile = caller_profile;
+			modem->caller_profile = caller_profile;
 		} else {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(*new_session), SWITCH_LOG_ERROR, "Doh! no caller profile\n");
 			switch_core_session_destroy(new_session);
@@ -920,7 +949,7 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 		}
 
 
-		switch_set_flag_locked(tech_pvt, TFLAG_OUTBOUND);
+		switch_set_flag_locked(modem, TFLAG_OUTBOUND);
 		switch_channel_set_state(channel, CS_INIT);
 		return SWITCH_CAUSE_SUCCESS;
 	}
@@ -931,9 +960,10 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 
 static switch_status_t channel_receive_event(switch_core_session_t *session, switch_event_t *event)
 {
-	struct private_object *tech_pvt = switch_core_session_get_private(session);
+	struct ofono_modem_t *modem = switch_core_session_get_private(session);
 	char *body = switch_event_get_body(event);
-	switch_assert(tech_pvt != NULL);
+
+	switch_assert(modem != NULL);
 
 	if (!body) {
 		body = "";
@@ -1197,20 +1227,12 @@ static char *get_modem_name_from_event(const char *event, char *modem_name, int 
 	return NULL;
 }
 
-typedef struct ofono_modem {
-	char name[MODEM_NAME_LEN];
-	int audiosock;
-	uint8_t pcm_write_buf[SCO_PCM_MTU * 10];
-	int write_in_use;
-	uint8_t pcm_read_buf[SCO_PCM_MTU * 10];
-	int read_in_use;
-} ofono_modem_t;
-
 static void handle_incoming_call(const char *modem_name)
 {
 	switch_channel_t *channel = NULL;
 	switch_core_session_t *session = NULL;
 	ofono_modem_t *modem = NULL;
+	char chan_name[128];
 
 	modem = switch_core_hash_find(globals.modems, modem_name);
 	if (!modem) {
@@ -1233,7 +1255,37 @@ static void handle_incoming_call(const char *modem_name)
 		switch_core_session_destroy(&session);
 		return;
 	}
+	modem->caller_profile = switch_caller_profile_new(switch_core_session_get_pool(session),
+							"HandsFree",
+							"XML",
+							"Moises",
+							"1234",
+							NULL,
+							"5678",
+							"5678",
+							"1234",
+							(char *)modname,
+							"default",
+							"1234");
+	switch_assert(modem->caller_profile != NULL);
 
+
+	snprintf(chan_name, sizeof(chan_name), "HandsFree/%s/%s", modem->name, modem->caller_profile->destination_number);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Connect inbound channel %s\n", chan_name);
+	switch_channel_set_name(channel, chan_name);
+	switch_channel_set_caller_profile(channel, modem->caller_profile);
+#if 0
+	switch_channel_set_variable(channel, "handsfree_network", "blah");
+#endif
+
+	switch_channel_set_state(channel, CS_INIT);
+
+	/* bring the session alive! */
+	if (switch_core_session_thread_launch(session) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Error spawning session thread!\n");
+		switch_core_session_destroy(&session);
+		return;
+	}
 }
 
 #define VCM_NEW_CALL_EVENT "CallAdded"
