@@ -41,6 +41,11 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime);
 SWITCH_MODULE_DEFINITION(mod_handsfree, mod_handsfree_load, mod_handsfree_shutdown, mod_handsfree_runtime);
 
+#define LIST_MODEMS_SCRIPT "list-modems"
+#define MONITOR_SCRIPT "monitor-ofono"
+#define ANSWER_SCRIPT "answer"
+#define HANGUP_SCRIPT "hangup"
+
 #define EVENT_NAME_LEN 255
 #define MODEM_NAME_LEN 255
 #define MODEM_ID_LEN 255
@@ -102,6 +107,8 @@ typedef struct ofono_modem {
 
 	char dialplan[255];
 	char context[255];
+
+	uint8_t got_hangup;
 } ofono_modem_t;
 
 static struct {
@@ -131,6 +138,8 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 static switch_status_t channel_read_frame(switch_core_session_t *session, switch_frame_t **frame, switch_io_flag_t flags, int stream_id);
 static switch_status_t channel_write_frame(switch_core_session_t *session, switch_frame_t *frame, switch_io_flag_t flags, int stream_id);
 static switch_status_t channel_kill_channel(switch_core_session_t *session, int sig);
+
+static void execute_script(switch_stream_handle_t *stream, char *script, char *arg1);
 
 /** SCO audio stuff **/
 
@@ -690,6 +699,7 @@ static switch_status_t channel_on_destroy(switch_core_session_t *session)
 		if (switch_core_codec_ready(&modem->write_codec)) {
 			switch_core_codec_destroy(&modem->write_codec);
 		}
+		modem->session = NULL;
 	}
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -707,10 +717,16 @@ static switch_status_t channel_on_hangup(switch_core_session_t *session)
 	switch_assert(modem != NULL);
 
 	switch_clear_flag_locked(modem, TFLAG_IO);
-	switch_clear_flag_locked(modem, TFLAG_VOICE);
-
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "%s CHANNEL HANGUP\n", switch_channel_get_name(channel));
+
+	switch_mutex_lock(modem->mutex);
+	if (!modem->got_hangup) {
+		execute_script(NULL, HANGUP_SCRIPT, NULL);
+		modem->got_hangup = 1;
+	}
+	switch_mutex_unlock(modem->mutex);
+
 	switch_mutex_lock(globals.mutex);
 	globals.calls--;
 	if (globals.calls < 0) {
@@ -734,8 +750,10 @@ static switch_status_t channel_kill_channel(switch_core_session_t *session, int 
 
 	switch (sig) {
 	case SWITCH_SIG_KILL:
+		switch_set_flag_locked(modem, TFLAG_IO);
 		break;
 	case SWITCH_SIG_BREAK:
+		switch_set_flag_locked(modem, TFLAG_BREAK);
 		break;
 	default:
 		break;
@@ -776,42 +794,42 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 
 	modem = switch_core_session_get_private(session);
 	switch_assert(modem != NULL);
+
 	modem->read_frame.flags = SFF_NONE;
 	*frame = NULL;
 
 	modem->readcnt++;
+	if (!(modem->readcnt % 1000)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "modem %s read %d\n", modem->name, modem->readcnt);
+	}
 	while (switch_test_flag(modem, TFLAG_IO)) {
 
 		if (switch_test_flag(modem, TFLAG_BREAK)) {
 			switch_clear_flag(modem, TFLAG_BREAK);
-			goto cng;
+			goto do_cng;
 		}
 
 		if (!switch_test_flag(modem, TFLAG_IO)) {
 			return SWITCH_STATUS_FALSE;
 		}
 
-		if (switch_test_flag(modem, TFLAG_IO) && switch_test_flag(modem, TFLAG_VOICE)) {
-			switch_clear_flag_locked(modem, TFLAG_VOICE);
-			if (!modem->read_frame.datalen) {
-				continue;
-			}
-			*frame = &modem->read_frame;
-			return SWITCH_STATUS_SUCCESS;
-		}
-		switch_cond_next();
+		data = (switch_byte_t *) modem->read_frame.data;
+		data[0] = 65;
+		data[1] = 0;
+		modem->read_frame.datalen = 2;
+		modem->read_frame.flags = SFF_CNG;
+		*frame = &modem->read_frame;
+		switch_sleep(20000);
+		return SWITCH_STATUS_SUCCESS;
 	}
 
-	return SWITCH_STATUS_FALSE;
-
-  cng:
+do_cng:
 	data = (switch_byte_t *) modem->read_frame.data;
 	data[0] = 65;
 	data[1] = 0;
 	modem->read_frame.datalen = 2;
 	modem->read_frame.flags = SFF_CNG;
 	*frame = &modem->read_frame;
-
 	return SWITCH_STATUS_SUCCESS;
 
 }
@@ -849,11 +867,15 @@ static switch_status_t channel_receive_message(switch_core_session_t *session, s
 
 	modem = switch_core_session_get_private(session);
 	switch_assert(modem != NULL);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "receiving message %d in modem %s\n", msg->message_id, modem->name);
 
 	switch (msg->message_id) {
 	case SWITCH_MESSAGE_INDICATE_ANSWER:
 		{
+			switch_mutex_lock(modem->mutex);
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Answering modem %s\n", modem->name);
+			execute_script(NULL, ANSWER_SCRIPT, NULL);
+			switch_mutex_unlock(modem->mutex);
 		}
 		break;
 	default:
@@ -902,6 +924,9 @@ static switch_status_t modem_init(ofono_modem_t *modem, switch_core_session_t *s
 	modem->read_frame.codec = &modem->read_codec;
 	modem->read_frame.data = modem->databuf;
 	modem->read_frame.buflen = sizeof(modem->databuf);
+	modem->readcnt = 1001;
+	modem->writecnt = 1001;
+	modem->got_hangup = 0;
 
 	/* associate modem to session and viceversa */
 	modem->session = session;
@@ -1039,6 +1064,7 @@ static switch_status_t load_config(void)
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Added modem '%s'\n", modem_id);
 
 			switch_mutex_init(&modem->mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
+			switch_mutex_init(&modem->flag_mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
 			snprintf(modem->id, sizeof(modem->id), "%s", modem_id);
 			snprintf(modem->name, sizeof(modem->name), "%s", modem_id);
 			snprintf(modem->dialplan, sizeof(modem->dialplan), "%s", "XML");
@@ -1072,7 +1098,7 @@ static switch_status_t load_config(void)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static void execute_script(switch_stream_handle_t *stream, char *script)
+static void execute_script(switch_stream_handle_t *stream, char *script, char *arg1)
 {
 	char cmdpath[1024];
 	char linebuf[2048];
@@ -1082,7 +1108,7 @@ static void execute_script(switch_stream_handle_t *stream, char *script)
 	int fromfs[2];
 	int pid;
 	int fd;
-	char *argv[] = { script, NULL };
+	char *argv[] = { script, arg1, NULL };
 
 	snprintf(cmdpath, sizeof(cmdpath), "%s%s%s", SWITCH_GLOBAL_dirs.script_dir, SWITCH_PATH_SEPARATOR, script);
 
@@ -1165,7 +1191,11 @@ static void execute_script(switch_stream_handle_t *stream, char *script)
 					break;
 				}
 				linebuf[rc] = 0;
-				stream->write_function(stream, "%s", linebuf);
+				if (stream) {
+					stream->write_function(stream, "%s", linebuf);
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s\n");
+				}
 			} else if (POLLERR & fdset.revents) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Poll error when waiting for script output\n");
 				break;
@@ -1185,8 +1215,6 @@ static void execute_script(switch_stream_handle_t *stream, char *script)
 	}
 }
 
-#define LIST_MODEMS_SCRIPT "list-modems"
-#define MONITOR_SCRIPT "monitor-ofono"
 SWITCH_STANDARD_API(handsf_function)
 {
 	char *argv[10];
@@ -1207,7 +1235,7 @@ SWITCH_STANDARD_API(handsf_function)
 	}
 
 	if (!strcasecmp(argv[0], "list")) {
-		execute_script(stream, LIST_MODEMS_SCRIPT);	
+		execute_script(stream, LIST_MODEMS_SCRIPT, NULL);
 	} else {
 		stream->write_function(stream, "-ERR Invalid parameter");
 	}
@@ -1271,6 +1299,48 @@ static char *get_modem_name_from_line(const char *line, char *modem_name, int mo
 		str++;
 	}
 	return NULL;
+}
+
+static void handle_call_hangup(const char *modem_name)
+{
+	switch_channel_t *channel = NULL;
+	switch_core_session_t *session = NULL;
+	ofono_modem_t *modem = NULL;
+	modem = switch_core_hash_find(globals.modems, modem_name);
+	if (!modem) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Hangup call in unknown modem '%s'\n", modem_name);
+		return;
+	}
+
+	switch_mutex_lock(modem->mutex);
+	session = modem->session;
+
+	if (modem->got_hangup) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Hangup ack in modem '%s'\n", modem_name);
+		/* is a hangup ack from the hangup we originated */
+		modem->got_hangup = 0;
+		switch_mutex_unlock(modem->mutex);
+		return;
+	}
+	
+	/* modem is requesting us to hangup the call, send hangup to the session */
+	if (!modem->session) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Hangup call in modem '%s' without a session\n", modem_name);
+		switch_mutex_unlock(modem->mutex);
+		return;
+	}
+	switch_core_session_read_lock(session);
+
+	channel = switch_core_session_get_channel(session);
+	switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_CLEARING);
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Hung up call in modem %s\n", modem_name);
+
+	modem->got_hangup = 1;
+
+	switch_core_session_rwunlock(session);
+
+	switch_mutex_unlock(modem->mutex);
 }
 
 static void handle_incoming_call(const char *modem_name)
@@ -1366,6 +1436,7 @@ static void handle_call_manager_event(const char *event)
 			return;
 		}
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Hangup call in modem %s\n", modem_name);
+		handle_call_hangup(modem_name);
 	} else {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignored VoiceCallManager event: %s\n", event_str);
 	}
