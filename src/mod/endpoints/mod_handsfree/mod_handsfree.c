@@ -109,6 +109,10 @@ typedef struct ofono_modem {
 	char context[255];
 
 	uint8_t got_hangup;
+
+	char bluez_path[512];
+	int audio_service_fd;
+	int audio_fd;
 } ofono_modem_t;
 
 static struct {
@@ -119,7 +123,6 @@ static struct {
 	volatile uint8_t thread_running;
 	switch_hash_t *modems;
 	switch_memory_pool_t *module_pool;
-	int audio_service_fd;
 	char dialplan[255];
 	char context[255];
 	ofono_modem_t modems_array[50];
@@ -522,102 +525,6 @@ static int stop_stream(int servicefd, char *obj)
 	return 0;
 }
 
-/*static const char digital_milliwatt[] = {0x1e,0x0b,0x0b,0x1e,0x9e,0x8b,0x8b,0x9e} ;*/
-void run_sco_service(char *devname)
-{
-	union {
-		bt_audio_msg_header_t h;
-		bt_audio_error_t error;
-		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
-	} msg;
-	uint8_t pcmbuf[SCO_PCM_MTU];
-	struct pollfd svcpoll[2];
-	int rc = 0;
-	int audiostopped = 0;
-	int pcmsock = 0;
-	int svcsock = globals.audio_service_fd;
-
-	if (print_caps(svcsock, devname)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not get capabilities for device %s\n", devname);
-		return;
-	}
-
-	if (open_device(svcsock, devname)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not open audio service for device %s\n", devname);
-		return;
-	}
-
-	if ((pcmsock = start_stream(svcsock, devname)) < 0) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not start audio service for device %s\n", devname);
-		return;
-	}
-
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Audio socket is %d\n", pcmsock);
-
-	svcpoll[0].fd = svcsock;
-	svcpoll[0].events = POLLIN | POLLERR;
-	svcpoll[1].fd = pcmsock;
-	svcpoll[1].events = POLLIN | POLLERR;
-	audiostopped = 0;
-	for ( ; ; ) {
-
-		svcpoll[0].revents = 0;
-		svcpoll[1].revents = 0;
-
-		rc = poll(svcpoll, 2, -1);
-		if (rc < 0) {
-			if (errno == EINTR) {
-				break;
-			}
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error polling audio connection: %s\n", strerror(errno));
-			break;
-		}
-
-		if ((svcpoll[0].revents & POLLERR)) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "POLLERR in service connection\n");
-			break;
-		}
-
-		if ((svcpoll[1].revents & POLLERR)) {
-			audiostopped = 1;
-			close(pcmsock);
-			pcmsock = -1;
-			break;
-		}
-
-		if ((svcpoll[0].revents & POLLIN)) {
-			rc = read_message(svcsock, &msg.h, sizeof(msg));
-			if (rc < 0) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to read bluez audio service message\n");
-				break;
-			}
-		}
-
-		if ((svcpoll[1].revents & POLLIN)) {
-			rc = read(pcmsock, pcmbuf, sizeof(pcmbuf));
-			if (rc < 0) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error reading from audio connection: %s\n", strerror(errno));
-				break;
-			}
-			if (rc != sizeof(pcmbuf)) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Short read from audio connection (%d bytes)\n", rc);
-			}
-			rc = write(pcmsock, pcmbuf, rc);
-			if (rc < 0) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error writing to audio connection: %s\n", strerror(errno));
-				break;
-			}
-			if (rc != sizeof(pcmbuf)) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Short write to audio connection (%d bytes)\n", rc);
-			}
-		}
-	}
-
-	stop_stream(svcsock, devname);
-
-}
-
-
 /* 
    State methods they get called when the state changes to the specific state 
    returning SWITCH_STATUS_SUCCESS tells the core to execute the standard state method next
@@ -704,6 +611,23 @@ static switch_status_t channel_on_destroy(switch_core_session_t *session)
 	return SWITCH_STATUS_SUCCESS;
 }
 
+static void modem_start_stream(ofono_modem_t *modem)
+{
+	modem->audio_fd = start_stream(modem->audio_service_fd, modem->bluez_path);
+	if (modem->audio_fd < 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to start streaming on modem %s\n", modem->name);
+	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Streaming on modem %s started with fd %d\n", modem->name, modem->audio_fd);
+}
+
+static void modem_stop_stream(ofono_modem_t *modem)
+{
+	if (modem->audio_fd >= 0) {
+		stop_stream(modem->audio_service_fd, modem->bluez_path);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Stopped streaming on modem %s with fd %d\n", modem->name, modem->audio_fd);
+		modem->audio_fd = -1;
+	}
+}
 
 static switch_status_t channel_on_hangup(switch_core_session_t *session)
 {
@@ -722,6 +646,7 @@ static switch_status_t channel_on_hangup(switch_core_session_t *session)
 
 	switch_mutex_lock(modem->mutex);
 	if (!modem->got_hangup) {
+		modem_stop_stream(modem);
 		execute_script(NULL, HANGUP_SCRIPT, NULL);
 		modem->got_hangup = 1;
 	}
@@ -783,11 +708,22 @@ static switch_status_t channel_send_dtmf(switch_core_session_t *session, const s
 	return SWITCH_STATUS_SUCCESS;
 }
 
+#define FIXED_READ_SIZE 320
 static switch_status_t channel_read_frame(switch_core_session_t *session, switch_frame_t **frame, switch_io_flag_t flags, int stream_id)
 {
 	switch_channel_t *channel = NULL;
 	ofono_modem_t *modem = NULL;
 	switch_byte_t *data;
+	union {
+		bt_audio_msg_header_t h;
+		bt_audio_error_t error;
+		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
+	} msg;
+	struct pollfd svcpoll[2];
+	uint8_t pcmbuf[SCO_PCM_MTU];
+	int rc = 0;
+	int len = 0;
+	int diff = 0;
 
 	channel = switch_core_session_get_channel(session);
 	switch_assert(channel != NULL);
@@ -795,6 +731,13 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 	modem = switch_core_session_get_private(session);
 	switch_assert(modem != NULL);
 
+	if (modem->audio_fd < 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "modem %s has no audio setup\n", modem->name, modem->readcnt);
+		switch_clear_flag_locked(modem, TFLAG_IO);
+		return SWITCH_STATUS_GENERR;
+	}
+
+	modem->read_frame.datalen = 0;
 	modem->read_frame.flags = SFF_NONE;
 	*frame = NULL;
 
@@ -802,26 +745,99 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 	if (!(modem->readcnt % 1000)) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "modem %s read %d\n", modem->name, modem->readcnt);
 	}
-	while (switch_test_flag(modem, TFLAG_IO)) {
 
-		if (switch_test_flag(modem, TFLAG_BREAK)) {
-			switch_clear_flag(modem, TFLAG_BREAK);
-			goto do_cng;
-		}
+	data = (switch_byte_t *)modem->read_frame.data;
+	for ( ; ; ) {
 
 		if (!switch_test_flag(modem, TFLAG_IO)) {
 			return SWITCH_STATUS_FALSE;
 		}
 
-		data = (switch_byte_t *) modem->read_frame.data;
-		data[0] = 65;
-		data[1] = 0;
-		modem->read_frame.datalen = 2;
-		modem->read_frame.flags = SFF_CNG;
-		*frame = &modem->read_frame;
-		switch_sleep(20000);
-		return SWITCH_STATUS_SUCCESS;
+		if (switch_test_flag(modem, TFLAG_BREAK)) {
+			switch_clear_flag(modem, TFLAG_BREAK);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "modem %s doing CNG\n", modem->name);
+			goto do_cng;
+		}
+
+		svcpoll[0].fd = modem->audio_service_fd;
+		svcpoll[0].events = POLLIN | POLLERR;
+		svcpoll[1].fd = modem->audio_fd;
+		svcpoll[1].events = POLLIN | POLLERR;
+
+		svcpoll[0].revents = 0;
+		svcpoll[1].revents = 0;
+
+		rc = poll(svcpoll, 2, 100);
+		if (rc < 0) {
+			if (errno == EINTR) {
+				break;
+			}
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error polling audio connection: %s\n", strerror(errno));
+			break;
+		}
+
+		if (!rc) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "modem %s audio timed out, doing CNG\n", modem->name);
+			goto do_cng;
+		}
+
+		if ((svcpoll[0].revents & POLLERR)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "POLLERR in service connection\n");
+			break;
+		}
+
+		if ((svcpoll[1].revents & POLLERR)) {
+			modem_stop_stream(modem);
+			break;
+		}
+
+		if ((svcpoll[0].revents & POLLIN)) {
+			rc = read_message(modem->audio_service_fd, &msg.h, sizeof(msg));
+			if (rc < 0) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to read bluez audio service message\n");
+				break;
+			}
+		}
+
+		if ((svcpoll[1].revents & POLLIN)) {
+
+			rc = read(modem->audio_fd, pcmbuf, sizeof(pcmbuf));
+
+			if (rc < 0) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error reading from audio connection: %s\n", strerror(errno));
+				break;
+			}
+
+			if (rc != sizeof(pcmbuf)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Short read from audio connection (%d bytes)\n", rc);
+			}
+
+			/* check if we have enough to return a frame */
+			len = modem->read_frame.datalen + rc;
+			if (len >= FIXED_READ_SIZE) {
+				diff = len - FIXED_READ_SIZE;
+				memcpy(data, pcmbuf, (rc - diff));
+				break;
+			}
+			memcpy(data, pcmbuf, rc);
+			data += rc;
+			modem->read_frame.datalen = 2;
+#if 1
+			rc = write(modem->audio_fd, pcmbuf, rc);
+			if (rc < 0) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error writing to audio connection: %s\n", strerror(errno));
+				break;
+			}
+			if (rc != sizeof(pcmbuf)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Short write to audio connection (%d bytes)\n", rc);
+			}
+#endif
+		}
+
 	}
+
+	*frame = &modem->read_frame;
+	return SWITCH_STATUS_SUCCESS;
 
 do_cng:
 	data = (switch_byte_t *) modem->read_frame.data;
@@ -875,6 +891,7 @@ static switch_status_t channel_receive_message(switch_core_session_t *session, s
 			switch_mutex_lock(modem->mutex);
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Answering modem %s\n", modem->name);
 			execute_script(NULL, ANSWER_SCRIPT, NULL);
+			modem_start_stream(modem);
 			switch_mutex_unlock(modem->mutex);
 		}
 		break;
@@ -1025,6 +1042,30 @@ switch_io_routines_t handsfree_io_routines = {
 	/*.receive_event */ channel_receive_event
 };
 
+
+static int setup_sco_audio(ofono_modem_t *modem)
+{
+	/* connect to the audio service*/
+	modem->audio_service_fd = bt_audio_service_open();
+	if (modem->audio_service_fd < 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Failed to open audio service connection for modem %s\n", modem->name);
+		return -1;
+	}
+
+	if (print_caps(modem->audio_service_fd, modem->bluez_path)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not get capabilities for modem %s, make sure the path is correct: %s\n", modem->name, modem->bluez_path);
+		bt_audio_service_close(modem->audio_service_fd);
+		return -1;
+	}
+
+	if (open_device(modem->audio_service_fd, modem->bluez_path)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not open audio for modem %s, make sure the path is correct: %s\n", modem->name, modem->bluez_path);
+		bt_audio_service_close(modem->audio_service_fd);
+		return -1;
+	}
+	return 0;
+}
+
 static switch_status_t load_config(void)
 {
 	char *cf = "handsfree.conf";
@@ -1059,20 +1100,16 @@ static switch_status_t load_config(void)
 				continue;
 			}
 
-			switch_core_hash_insert(globals.modems, modem_id, modem);
-
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Added modem '%s'\n", modem_id);
-
-			switch_mutex_init(&modem->mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
-			switch_mutex_init(&modem->flag_mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
+			memset(modem, 0, sizeof(*modem));
 			snprintf(modem->id, sizeof(modem->id), "%s", modem_id);
 			snprintf(modem->name, sizeof(modem->name), "%s", modem_id);
 			snprintf(modem->dialplan, sizeof(modem->dialplan), "%s", "XML");
 			snprintf(modem->context, sizeof(modem->context), "%s", "public");
 
-			for (param = switch_xml_child(settings, "param"); param; param = param->next) {
+			for (param = switch_xml_child(mymodem, "param"); param; param = param->next) {
 				char *var = (char *) switch_xml_attr_soft(param, "name");
 				char *val = (char *) switch_xml_attr_soft(param, "value");
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "modem %s -> %s = %s\n", modem->id, var, val);
 				if (!strcasecmp(var, "dialplan")) {
 					snprintf(modem->dialplan, sizeof(modem->dialplan), "%s", val);
 				}
@@ -1080,10 +1117,30 @@ static switch_status_t load_config(void)
 					snprintf(modem->context, sizeof(modem->context), "%s", val);
 				} 
 				else if (!strcasecmp(var, "name")) {
-					snprintf(modem->name, sizeof(modem->name), "%s", modem_id);
+					snprintf(modem->name, sizeof(modem->name), "%s", val);
+				}
+				else if (!strcasecmp(var, "bluez-path")) {
+					snprintf(modem->bluez_path, sizeof(modem->bluez_path), "%s", val);
 				}
 			}
+			
+			if (!strlen(modem->bluez_path)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "bluez-path parameter is required but missing in modem %s configuration\n", modem->name);
+				continue;
+			}
 
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Preparing audio for modem %s\n", modem->name);
+			if (setup_sco_audio(modem)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "failed to setup audio for modem %s\n", modem->name);
+				continue;
+			}
+
+			switch_core_hash_insert(globals.modems, modem_id, modem);
+
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Added modem '%s'\n", modem_id);
+
+			switch_mutex_init(&modem->mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
+			switch_mutex_init(&modem->flag_mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
 			modem_i++;
 			if (modem_i == switch_arraylen(globals.modems_array)) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Maximum number of modems reached, "
@@ -1313,6 +1370,9 @@ static void handle_call_hangup(const char *modem_name)
 	}
 
 	switch_mutex_lock(modem->mutex);
+
+	modem_stop_stream(modem);
+
 	session = modem->session;
 
 	if (modem->got_hangup) {
@@ -1588,6 +1648,11 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown)
 {
+	ofono_modem_t *modem = NULL;
+	switch_hash_index_t *i;
+	const void *key;
+	void *val;
+
 	/* stop threads  */
 	globals.running = 0;
 
@@ -1597,13 +1662,21 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown)
 	}
 
 	/* close all audio connections to the devices */
-	close_device(globals.audio_service_fd, NULL);
-
-	bt_audio_service_close(globals.audio_service_fd);
+	for (i = switch_hash_first(NULL, globals.modems); i; i = switch_hash_next(i)) {
+		switch_hash_this(i, &key, NULL, &val);
+		modem = val;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Closing audio connection for modem %s\n", modem->name);
+		if (modem->audio_service_fd > 0) {
+			close_device(modem->audio_service_fd, modem->bluez_path);
+			bt_audio_service_close(modem->audio_service_fd);
+			modem->audio_service_fd = -1;
+		}
+	}
 
 	switch_core_hash_destroy(&globals.modems);
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Handsfree Done!\n");
+
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -1625,17 +1698,6 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 
 	/* update modems hash with real time information */
 	load_modems();
-
-	/* connect to the audio service*/
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Openning connection to bluez audio service at %s\n", BT_IPC_SOCKET_NAME);
-
-	globals.audio_service_fd = bt_audio_service_open();
-	if (globals.audio_service_fd < 0) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "connection to bluez audio service failed\n");
-		return SWITCH_STATUS_FALSE;
-	}
-
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Connected to the bluez audio service successfully\n");
 
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 	handsfree_endpoint_interface = switch_loadable_module_create_interface(*module_interface, SWITCH_ENDPOINT_INTERFACE);
