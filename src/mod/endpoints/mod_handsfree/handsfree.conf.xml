@@ -12,6 +12,11 @@
   	<modem id="00158315A310_001D284B9AA8">
   		<!-- optional friendly name (if not set, the bluetooth device friendly name will be used) -->
     		<param name="name" value="sony-ericson-1"/>
+		<!-- required parameter. This path is obtained from ofono logs, we need to find a way to find it automatically 
+		the dev_xxx is easy as can be obtained from the id, 14806 seems to be the PID of the bluetoothd daemon, I can
+		find both through shell scripts or C, but hci0, which is the adapter, probably will always have to be provided
+		-->
+    		<param name="bluez-path" value="/org/bluez/14806/hci0/dev_00_1D_28_4B_9A_A8"/>
   		<!-- where to send the incoming calls to -->
     		<param name="dialplan" value="XML"/>
     		<param name="context" value="default"/>

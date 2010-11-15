@@ -1,0 +1,25 @@
+Installation requires bluez and ofono, recent enough to have the file descriptor passing feature.
+
+Version tested: 
+
+ofono-0.29
+bluez-4.72
+
+-- Installation --
+
+Just do a regular FreeSWITCH installation.
+
+mod_handsfree must be uncommented in modules.conf
+
+-- Configuration --
+See src/mod/endpoints/mod_handsfree/handsfree.conf.xml
+
+-- Limitations --
+
+- No outbound dialing yet, easy to add, just requires a bit more work.
+- only works for 1 modem. I need to update the python scripts to accept modem name as argument
+- bluez-path in configuration must be provided, eventually can be automatically found or at least
+  made much easier only requiring the adapter interface
+- Not very tolerant to errors, I need to add code to determine if ofono daemon is running and whether
+  the modems are connected or not. If one script fails, I don't check for failures to give useful output.
+
