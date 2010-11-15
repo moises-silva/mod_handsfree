@@ -13,6 +13,7 @@ mod_handsfree must be uncommented in modules.conf
 
 -- Configuration --
 See src/mod/endpoints/mod_handsfree/handsfree.conf.xml
+copy all src/mod/endpoints/mod_handsfree/scripts/ contents to ${prefix}/scripts (typically /usr/local/freeswitch/scripts)
 
 -- Limitations --
 
