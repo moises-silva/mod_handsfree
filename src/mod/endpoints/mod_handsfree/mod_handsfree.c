@@ -81,13 +81,13 @@ typedef struct ofono_modem {
 	/* audio connection to bluez */
 	int audiosock;
 
-	uint8_t pcm_write_buf[SCO_PCM_MTU * 10];
-	int write_in_use;
-	int writecnt;
+	uint8_t pcm_write_buf[SCO_PCM_MTU];
+	int pcm_write_buf_len;
+	uint64_t writecnt;
 
-	uint8_t pcm_read_buf[SCO_PCM_MTU * 10];
-	int read_in_use;
-	int readcnt;
+	uint8_t pcm_read_buf[SCO_PCM_MTU];
+	int pcm_read_buf_len;
+	uint64_t readcnt;
 
 	unsigned char databuf[SWITCH_RECOMMENDED_BUFFER_SIZE];
 	switch_core_session_t *session;
@@ -767,29 +767,30 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 		goto do_cng;
 	}
 
-	switch_mutex_lock(modem->mutex);
-
 	modem->read_frame.datalen = 0;
 	modem->read_frame.flags = SFF_NONE;
 	*frame = NULL;
 
 	modem->readcnt++;
 	if (!(modem->readcnt % 1000)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "modem %s read %d\n", modem->name, modem->readcnt);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "modem %s read: %llu\n", modem->name, modem->readcnt);
 	}
 
 	dataptr = (switch_byte_t *)modem->read_frame.data;
+	if (modem->pcm_read_buf_len) {
+		memcpy(dataptr, modem->pcm_read_buf, modem->pcm_read_buf_len);
+		dataptr += modem->pcm_read_buf_len;
+		modem->pcm_read_buf_len = 0;
+	}
 	for ( ; ; ) {
 
 		if (!switch_test_flag(modem, TFLAG_IO)) {
-			switch_mutex_unlock(modem->mutex);
 			return SWITCH_STATUS_FALSE;
 		}
 
 		if (switch_test_flag(modem, TFLAG_BREAK)) {
 			switch_clear_flag(modem, TFLAG_BREAK);
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "break modem %s doing CNG\n", modem->name);
-			switch_mutex_unlock(modem->mutex);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "break modem %s doing CNG\n", modem->name);
 			goto do_cng;
 		}
 
@@ -857,14 +858,17 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 			len = modem->read_frame.datalen + rc;
 			if (len >= FIXED_READ_SIZE) {
 				diff = len - FIXED_READ_SIZE;
-				memcpy(dataptr, pcmbuf, (rc - diff));
+				len = rc - diff;
+				memcpy(dataptr, pcmbuf, len);
 				modem->read_frame.datalen += rc;
+				memcpy(modem->pcm_read_buf, &pcmbuf[len], diff);
+				modem->pcm_read_buf_len = len;
 				break;
 			}
 			memcpy(dataptr, pcmbuf, rc);
 			dataptr += rc;
 			modem->read_frame.datalen += rc;
-#if 1
+#if 0
 			rc = write(modem->audio_fd, pcmbuf, rc);
 			if (rc < 0) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error writing to audio connection: %s\n", strerror(errno));
@@ -877,7 +881,6 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 		}
 
 	}
-	switch_mutex_unlock(modem->mutex);
 
 	*frame = &modem->read_frame;
 	return SWITCH_STATUS_SUCCESS;
@@ -897,6 +900,10 @@ static switch_status_t channel_write_frame(switch_core_session_t *session, switc
 {
 	switch_channel_t *channel = NULL;
 	ofono_modem_t *modem = NULL;
+	uint8_t pcmbuf[SCO_PCM_MTU];
+	char *dataptr = NULL;
+	int datalen = 0;
+	int rc = 0;
 
 	channel = switch_core_session_get_channel(session);
 	switch_assert(channel != NULL);
@@ -907,9 +914,71 @@ static switch_status_t channel_write_frame(switch_core_session_t *session, switc
 	if (!switch_test_flag(modem, TFLAG_IO)) {
 		return SWITCH_STATUS_FALSE;
 	}
-#if SWITCH_BYTE_ORDER == __BIG_ENDIAN
+
+	if (switch_test_flag(modem, TFLAG_HANGUP)) {
+		return SWITCH_STATUS_GENERR;
+	}
+
+	if (modem->audio_fd < 0) {
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	if (frame->datalen == 2) {
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	switch_assert(frame->datalen >= SCO_PCM_MTU);
+
+//#if SWITCH_BYTE_ORDER == __BIG_ENDIAN
+#if 0
 	switch_swap_linear(frame->data, (int) frame->datalen / 2);
 #endif
+	if (modem->pcm_write_buf_len) {
+		datalen = SCO_PCM_MTU - modem->pcm_write_buf_len;
+		dataptr = pcmbuf;
+		memcpy(dataptr, modem->pcm_write_buf, modem->pcm_write_buf_len);
+		dataptr += modem->pcm_write_buf_len;
+		memcpy(dataptr, frame->data, datalen);
+		modem->pcm_write_buf_len = 0;
+
+		rc = write(modem->audio_fd, pcmbuf, SCO_PCM_MTU);
+		if (rc < 0) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Failed to write to modem %s: %s\n", modem->name, strerror(errno));
+			return SWITCH_STATUS_GENERR;
+		}
+		if (rc != SCO_PCM_MTU) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Short write to modem %s of %d bytes\n", modem->name, rc);
+			return SWITCH_STATUS_GENERR;
+		}
+		/* continue writing the frame where left */
+		dataptr = frame->data + datalen;
+		datalen = frame->datalen - datalen;
+	} else {
+		/* nothing on modem write buffer, we can start from the beginning of the frame */
+		dataptr = frame->data + datalen;
+		datalen = frame->datalen;
+	}
+
+	/* write the data in the expected chunks */
+	while (datalen >= SCO_PCM_MTU) {
+		rc = write(modem->audio_fd, dataptr, SCO_PCM_MTU);
+		if (rc < 0) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Failed to write to modem %s: %s\n", modem->name, strerror(errno));
+			return SWITCH_STATUS_GENERR;
+		}
+		if (rc != SCO_PCM_MTU) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Short write to modem %s of %d bytes\n", modem->name, rc);
+			break;
+		}
+		datalen -= SCO_PCM_MTU;
+		dataptr += SCO_PCM_MTU;
+	}
+
+	if (datalen) {
+		memcpy(modem->pcm_write_buf, dataptr, datalen);
+		modem->pcm_write_buf_len = datalen;
+	}
+
 	modem->writecnt++;
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -986,6 +1055,8 @@ static switch_status_t modem_init(ofono_modem_t *modem, const char *call_name, s
 	modem->writecnt = 1000;
 	modem->got_hangup = 0;
 	modem->audio_fd = -1;
+	modem->pcm_read_buf_len = 0;
+	modem->pcm_write_buf_len = 0;
 	snprintf(modem->call_name, sizeof(modem->call_name), "%s", call_name);
 
 	/* associate modem to session and viceversa */

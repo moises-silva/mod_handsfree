@@ -1,8 +1,10 @@
 CC=gcc
-CFLAGS=-Wall
+CFLAGS=-Wall 
 GLIB_CFLAGS=-I/usr/include/glib-2.0 -I/usr/include/dbus-1.0 -I/usr/lib/glib-2.0/include
+LDFLAGS=-lrt
 
-all: audioclient list-names list-modems
+#all: audioclient list-names list-modems
+all: audioclient 
 
 audioclient.o: audioclient.c ipc.h
 	$(CC) $(CFLAGS) -c audioclient.c -o audioclient.o

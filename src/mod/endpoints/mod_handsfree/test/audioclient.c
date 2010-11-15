@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <time.h>
 #include "ipc.h"
 
 /* SCO connections work with 48 byte-sized frames only */
@@ -406,6 +408,14 @@ int main(int argc, char *argv[])
 	int svcsock = 0;
 	int pcmsock = 0;
 	int readcnt = 0;
+	struct timespec lastrcv;
+	struct timespec now;
+	uint64_t lastrcv_us = 0;
+	uint64_t now_us = 0;
+	uint64_t avgus = 0;
+	uint64_t maxus = 0;
+	uint64_t minus = ULONG_MAX;
+	uint64_t diffus = 0;
 
 	if (argc < 2) {
 		fprintf(stderr, "No device specified\n");
@@ -435,6 +445,7 @@ int main(int argc, char *argv[])
 start_streaming:	
 	printf("Press 'q' to quit or any other key to start streaming\n");
 	c = getchar();
+	getchar();
 	if (c == 'q') {
 		printf("Quitting ...\n");
 		goto done;
@@ -452,6 +463,8 @@ start_streaming:
 	svcpoll[1].events = POLLIN | POLLERR;
 	readcnt = 0;
 	audiostopped = 0;
+	memset(&lastrcv, 0, sizeof(lastrcv));
+	memset(&now, 0, sizeof(now));
 	for ( ; ; ) {
 
 		svcpoll[0].revents = 0;
@@ -495,6 +508,21 @@ start_streaming:
 			if (rc != sizeof(pcmbuf)) {
 				fprintf(stderr, "Short read from audio connection (%d bytes)\n", rc);
 			}
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			if (lastrcv.tv_sec) {
+				now_us = ((now.tv_sec * 1000000) + (now.tv_nsec / 1000));
+				lastrcv_us = ((lastrcv.tv_sec * 1000000) + (lastrcv.tv_nsec / 1000));
+				diffus = now_us - lastrcv_us;
+				if (diffus > maxus) {
+					maxus = diffus;
+				}
+				if (diffus < minus) {
+					minus = diffus;
+				}
+				avgus = (avgus + diffus) / 2;
+
+			}
+			memcpy(&lastrcv, &now, sizeof(lastrcv));
 			readcnt++;
 			rc = write(pcmsock, pcmbuf, rc);
 			if (rc < 0) {
@@ -507,8 +535,10 @@ start_streaming:
 		}
 	}
 
-	printf("Stopping stream after %d bytes streamed\n", (readcnt * PCM_MTU));
 	stop_stream(svcsock, devname);
+
+	printf("Stopping stream after %d bytes streamed, avgus = %llu, maxus = %llu, minus = %llu\n", 
+			(readcnt * PCM_MTU), avgus, maxus, minus);
 
 	if (audiostopped) {
 		goto start_streaming;
