@@ -815,7 +815,7 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 		}
 
 		if (!rc) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "modem %s audio timed out, doing CNG\n", modem->name);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "modem %s audio timed out, doing CNG\n", modem->name);
 			goto do_cng;
 		}
 
@@ -1072,6 +1072,30 @@ err:
 
 }
 
+static ofono_modem_t *find_modem_by_name(const char *name)
+{
+	switch_hash_index_t *i;
+	const void *key;
+	void *val;
+	ofono_modem_t *modem;
+
+	switch_mutex_lock(globals.mutex);
+
+	/* close all audio connections to the devices */
+	for (i = switch_hash_first(NULL, globals.modems); i; i = switch_hash_next(i)) {
+		switch_hash_this(i, &key, NULL, &val);
+		modem = val;
+		if (!strcasecmp(modem->name, name)) {
+			switch_mutex_unlock(globals.mutex);
+			return modem;
+		}
+	}
+
+	switch_mutex_unlock(globals.mutex);
+
+	return NULL;
+}
+
 
 /* Make sure when you have 2 sessions in the same scope that you pass the appropriate one to the routines
    that allocate memory or you will have 1 channel with memory allocated from another channel's pool!
@@ -1081,37 +1105,77 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 						switch_core_session_t **new_session, switch_memory_pool_t **pool, switch_originate_flag_t flags,
 						switch_call_cause_t *cancel_cause)
 {
+	char *argv[2];
+	int argc = 0;
+	char name[128];
+	ofono_modem_t *modem = NULL;
+	char *data = NULL;
+	const char *dest_num = NULL;
+	switch_channel_t *channel;
+	switch_caller_profile_t *caller_profile;
+
+	if (!outbound_profile) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Missing caller profile!\n");
+		return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
+	}
+
+	if (zstr(outbound_profile->destination_number)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Invalid dial string\n");
+		return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
+	}
+
+	data = switch_core_strdup(outbound_profile->pool, outbound_profile->destination_number);
+
+	if (!zstr(outbound_profile->destination_number)) {
+		dest_num = switch_sanitize_number(switch_core_strdup(outbound_profile->pool, outbound_profile->destination_number));
+	}
+
+	if ((argc = switch_separate_string(data, '/', argv, sizeof(argv)/sizeof(argv[0]))) < 1) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Invalid dial string\n");
+		return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
+	}
+
+
+	modem = find_modem_by_name(argv[0]);
+	if (!modem) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Cannot place outgoing call in unknown modem '%s'\n", argv[0]);
+		return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
+	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Placing call in modem %s (%s)\n", modem, modem->id);
+
+	switch_mutex_lock(modem->mutex);
+
+	if (modem->session) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Cannot place outgoing call in modem '%s', modem busy!\n", argv[0]);
+		goto error;
+	}
+
 	if ((*new_session = switch_core_session_request(handsfree_endpoint_interface, SWITCH_CALL_DIRECTION_OUTBOUND, flags, pool)) != 0) {
-		ofono_modem_t *modem;
-		switch_channel_t *channel;
-		switch_caller_profile_t *caller_profile;
 
 		switch_core_session_add_stream(*new_session, NULL);
 		channel = switch_core_session_get_channel(*new_session);
-		modem_init(modem, "not-set-yet", *new_session);
 
-		if (outbound_profile) {
-			char name[128];
-
-			snprintf(name, sizeof(name), "handsfree/%s", outbound_profile->destination_number);
-			switch_channel_set_name(channel, name);
-
-			caller_profile = switch_caller_profile_clone(*new_session, outbound_profile);
-			switch_channel_set_caller_profile(channel, caller_profile);
-			modem->caller_profile = caller_profile;
-		} else {
-			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(*new_session), SWITCH_LOG_ERROR, "Doh! no caller profile\n");
-			switch_core_session_destroy(new_session);
-			return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
+		if (modem_init(modem, "not-set-yet", *new_session)) {
+			goto error;
 		}
 
+		snprintf(name, sizeof(name), "handsfree/%s/%s", modem->name, outbound_profile->destination_number);
+		switch_channel_set_name(channel, name);
+
+		caller_profile = switch_caller_profile_clone(*new_session, outbound_profile);
+		switch_channel_set_caller_profile(channel, caller_profile);
+		modem->caller_profile = caller_profile;
 
 		switch_channel_set_state(channel, CS_INIT);
 		return SWITCH_CAUSE_SUCCESS;
 	}
 
-	return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
+	switch_mutex_unlock(modem->mutex);
+	return SWITCH_CAUSE_SUCCESS;
 
+error:
+	switch_mutex_unlock(modem->mutex);
+	return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
 }
 
 static switch_status_t channel_receive_event(switch_core_session_t *session, switch_event_t *event)
