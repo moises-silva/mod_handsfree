@@ -42,6 +42,7 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime);
 SWITCH_MODULE_DEFINITION(mod_handsfree, mod_handsfree_load, mod_handsfree_shutdown, mod_handsfree_runtime);
 
 #define LIST_MODEMS_SCRIPT "list-modems"
+#define LIST_DEVICES_SCRIPT "list-devices"
 #define MONITOR_SCRIPT "monitor-ofono"
 #define ANSWER_SCRIPT "answer"
 #define HANGUP_SCRIPT "hangup"
@@ -65,6 +66,9 @@ typedef enum {
 	TFLAG_BREAK = (1 << 1),
 	TFLAG_HANGUP = (1 << 2),
 } TFLAGS;
+
+typedef int (*script_consumer_cb_t)(char *line);
+static char *get_modem_id_from_line(const char *line, char *modem_id, int modem_id_len);
 
 switch_endpoint_interface_t *handsfree_endpoint_interface;
 
@@ -109,6 +113,8 @@ typedef struct ofono_modem {
 	char bluez_path[512];
 	int audio_service_fd;
 	int audio_fd;
+
+	uint8_t online;
 } ofono_modem_t;
 
 static struct {
@@ -138,7 +144,7 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 static switch_status_t channel_write_frame(switch_core_session_t *session, switch_frame_t *frame, switch_io_flag_t flags, int stream_id);
 static switch_status_t channel_kill_channel(switch_core_session_t *session, int sig);
 
-static void execute_script(switch_stream_handle_t *stream, char *script, char *arg1);
+static void execute_script(switch_stream_handle_t *stream, char *script, char *arg1, script_consumer_cb_t consumer_cb);
 
 /** SCO audio stuff **/
 
@@ -675,7 +681,7 @@ static switch_status_t channel_on_hangup(switch_core_session_t *session)
 	switch_mutex_lock(modem->mutex);
 	if (!modem->got_hangup) {
 		modem_stop_stream(modem);
-		execute_script(NULL, HANGUP_SCRIPT, NULL);
+		execute_script(NULL, HANGUP_SCRIPT, NULL, NULL);
 		modem->got_hangup = 1;
 	}
 	switch_mutex_unlock(modem->mutex);
@@ -1000,7 +1006,7 @@ static switch_status_t channel_receive_message(switch_core_session_t *session, s
 		{
 			switch_mutex_lock(modem->mutex);
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Answering modem %s\n", modem->name);
-			execute_script(NULL, ANSWER_SCRIPT, NULL);
+			execute_script(NULL, ANSWER_SCRIPT, NULL, NULL);
 			/* we do not start audio streaming until we get VoiceCall event with state == active */
 			switch_mutex_unlock(modem->mutex);
 		}
@@ -1270,16 +1276,21 @@ static switch_status_t load_config(void)
 	if ((modems = switch_xml_child(cfg, "modems"))) {
 		for (mymodem = switch_xml_child(modems, "modem"); mymodem; mymodem = mymodem->next) {
 			ofono_modem_t *modem = &globals.modems_array[modem_i];
-			char *modem_id = (char *)switch_xml_attr_soft(mymodem, "id");
+			char *name = (char *)switch_xml_attr_soft(mymodem, "name");
 
-			if (!modem_id) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignoring modem entry without id attribute\n");
+			if (!name) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignoring modem entry without name attribute\n");
+				continue;
+			}
+
+			modem = switch_core_hash_find(globals.modems, name);
+			if (modem) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Modem '%s' is already configured\n", name);
 				continue;
 			}
 
 			memset(modem, 0, sizeof(*modem));
-			snprintf(modem->id, sizeof(modem->id), "%s", modem_id);
-			snprintf(modem->name, sizeof(modem->name), "%s", modem_id);
+			snprintf(modem->name, sizeof(modem->name), "%s", name);
 			snprintf(modem->dialplan, sizeof(modem->dialplan), "%s", "XML");
 			snprintf(modem->context, sizeof(modem->context), "%s", "public");
 
@@ -1293,28 +1304,11 @@ static switch_status_t load_config(void)
 				else if (!strcasecmp(var, "context")) {
 					snprintf(modem->context, sizeof(modem->context), "%s", val);
 				} 
-				else if (!strcasecmp(var, "name")) {
-					snprintf(modem->name, sizeof(modem->name), "%s", val);
-				}
-				else if (!strcasecmp(var, "bluez-path")) {
-					snprintf(modem->bluez_path, sizeof(modem->bluez_path), "%s", val);
-				}
 			}
 			
-			if (!strlen(modem->bluez_path)) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "bluez-path parameter is required but missing in modem %s configuration\n", modem->name);
-				continue;
-			}
+			switch_core_hash_insert(globals.modems, name, modem);
 
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Preparing audio for modem %s\n", modem->name);
-			if (setup_sco_audio(modem)) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "failed to setup audio for modem %s\n", modem->name);
-				continue;
-			}
-
-			switch_core_hash_insert(globals.modems, modem_id, modem);
-
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Added modem '%s'\n", modem_id);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Added modem '%s'\n", modem);
 
 			switch_mutex_init(&modem->mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
 			switch_mutex_init(&modem->flag_mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
@@ -1332,7 +1326,7 @@ static switch_status_t load_config(void)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static void execute_script(switch_stream_handle_t *stream, char *script, char *arg1)
+static void execute_script(switch_stream_handle_t *stream, char *script, char *arg1, script_consumer_cb_t consumer_cb)
 {
 	char cmdpath[1024];
 	char linebuf[2048];
@@ -1428,7 +1422,14 @@ static void execute_script(switch_stream_handle_t *stream, char *script, char *a
 				if (stream) {
 					stream->write_function(stream, "%s", linebuf);
 				} else {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s\n");
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s\n", linebuf);
+				}
+				if (consumer_cb) {
+					rc = consumer_cb(linebuf);
+					if (rc) {
+						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Consumer callback requested to stop\n");
+						break;
+					}
 				}
 			} else if (POLLERR & fdset.revents) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Poll error when waiting for script output\n");
@@ -1469,7 +1470,7 @@ SWITCH_STANDARD_API(handsf_function)
 	}
 
 	if (!strcasecmp(argv[0], "list")) {
-		execute_script(stream, LIST_MODEMS_SCRIPT, NULL);
+		execute_script(stream, LIST_MODEMS_SCRIPT, NULL, NULL);
 	} else {
 		stream->write_function(stream, "-ERR Invalid parameter");
 	}
@@ -1480,8 +1481,77 @@ end:
 	return SWITCH_STATUS_SUCCESS;
 }
 
+static int parse_modem_line(char *line)
+{
+	static struct {
+		char modem_id[MODEM_ID_LEN];
+		char *id_str;
+		ofono_modem_t *modem;
+	} locals = {
+		.modem_id = { 0 },
+		.id_str = NULL,
+		.modem = NULL,
+	};
+	int online = 0;
+	char *eolchar = NULL;
+	char *val = NULL;
+
+	if (line[0] == '[') {
+		locals.id_str = get_modem_id_from_line(line, locals.modem_id, sizeof(locals.modem_id));
+		if (!locals.id_str) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not get modem from line '%s'\n", line);
+			return 0;
+		}
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Parsing modem '%s' runtime configuration\n", locals.id_str);
+	}
+
+	if ((val = strcasestr(line, "Name = "))) {
+		if (!locals.id_str) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Name with no modem in line '%s'\n", line);
+			return 0;
+		}
+		val++;
+		eolchar = strchr(val, '\n');
+		if (!eolchar) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Ignored modem '%s' with no EOL character\n", val);
+			return 0;
+		}
+		*eolchar = 0;
+		locals.modem = switch_core_hash_find(globals.modems, val);
+		if (!locals.modem) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Ignored modem '%s' not present in configuration\n", val);
+			return 0;
+		}
+		/* we create a separate register to find the modem by id */
+		locals.modem = switch_core_hash_find(globals.modems, locals.id_str);
+		if (locals.modem) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Modem %s was found twice!\n", locals.id_str);
+			return -1;
+		}
+		switch_core_hash_insert(globals.modems, locals.id_str, locals.modem);
+		snprintf(locals.modem->id, sizeof(locals.modem->id), "%s", locals.id_str);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Modem %s has id '%s'\n", locals.modem->name, locals.modem->id);
+
+	}
+	else if ((val = strcasestr(line, "Online = "))) {
+		if (!locals.modem) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Online parameter with no modem in line '%s'\n", line);
+			return 0;
+		}
+		val++;
+		locals.modem->online = atoi(val);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Modem %s is %s\n", locals.modem->online ? "online" : "offline");
+		/* we're done, clear the modem */
+		memset(&locals, 0, sizeof(locals));
+	}
+
+	return 0;
+}
+
 static void load_modems(void)
 {
+	/* find the bluez path for every device and whether the device is online or not */
+	execute_script(NULL, LIST_MODEMS_SCRIPT, NULL, parse_modem_line);
 }
 
 static char *skip_sender(const char *event)
@@ -1501,8 +1571,8 @@ static char *skip_sender(const char *event)
 	return str;
 }
 
-/* searching for pattern ..../hfp/<modem-name>/.... */
-static char *get_modem_name_from_line(const char *line, char *modem_name, int modem_name_len)
+/* searching for pattern ..../hfp/<modem-id>/.... */
+static char *get_modem_id_from_line(const char *line, char *modem_id, int modem_id_len)
 {
 	long len = 0;
 	const char *end = NULL;
@@ -1522,27 +1592,27 @@ static char *get_modem_name_from_line(const char *line, char *modem_name, int mo
 				return NULL;
 			}
 			len = (long)end - (long)str;
-			if (len >= modem_name_len) {
+			if (len >= modem_id_len) {
 				return NULL;
 			}
-			memcpy(modem_name, str, len);
-			modem_name[len] = 0;
-			modem_name[modem_name_len-1] = 0;
-			return modem_name;
+			memcpy(modem_id, str, len);
+			modem_id[len] = 0;
+			modem_id[modem_id_len-1] = 0;
+			return modem_id;
 		}
 		str++;
 	}
 	return NULL;
 }
 
-static void handle_call_hangup(const char *modem_name)
+static void handle_call_hangup(const char *modem_id)
 {
 	switch_channel_t *channel = NULL;
 	switch_core_session_t *session = NULL;
 	ofono_modem_t *modem = NULL;
-	modem = switch_core_hash_find(globals.modems, modem_name);
+	modem = switch_core_hash_find(globals.modems, modem_id);
 	if (!modem) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Hangup call in unknown modem '%s'\n", modem_name);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Hangup call in unknown modem '%s'\n", modem_id);
 		return;
 	}
 
@@ -1553,7 +1623,7 @@ static void handle_call_hangup(const char *modem_name)
 	session = modem->session;
 
 	if (modem->got_hangup) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Hangup ack in modem '%s'\n", modem_name);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Hangup ack in modem '%s'\n", modem_id);
 		/* is a hangup ack from the hangup we originated */
 		modem->got_hangup = 0;
 		switch_mutex_unlock(modem->mutex);
@@ -1562,7 +1632,7 @@ static void handle_call_hangup(const char *modem_name)
 	
 	/* modem is requesting us to hangup the call, send hangup to the session */
 	if (!modem->session) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Hangup call in modem '%s' without a session\n", modem_name);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Hangup call in modem '%s' without a session\n", modem_id);
 		switch_mutex_unlock(modem->mutex);
 		return;
 	}
@@ -1575,24 +1645,24 @@ static void handle_call_hangup(const char *modem_name)
 	channel = switch_core_session_get_channel(session);
 	switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_CLEARING);
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Hung up call in modem %s\n", modem_name);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Hung up call in modem %s\n", modem_id);
 
 	switch_core_session_rwunlock(session);
 }
 
-static void handle_incoming_call(const char *modem_name, const char *call_name)
+static void handle_incoming_call(const char *modem_id, const char *call_name)
 {
 	switch_channel_t *channel = NULL;
 	switch_core_session_t *session = NULL;
 	ofono_modem_t *modem = NULL;
 	char chan_name[128];
 
-	modem = switch_core_hash_find(globals.modems, modem_name);
+	modem = switch_core_hash_find(globals.modems, modem_id);
 	if (!modem) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Incoming call in unknown modem '%s'\n", modem_name);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Incoming call in unknown modem '%s'\n", modem_id);
 		return;
 	}
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Incoming call in modem %s\n", modem_name);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Incoming call in modem %s\n", modem_id);
 
 	/* notify FreeSWITCH about the incoming call */
 	if (!(session = switch_core_session_request(handsfree_endpoint_interface, SWITCH_CALL_DIRECTION_INBOUND, SOF_NONE, NULL))) {
@@ -1650,8 +1720,8 @@ static void handle_incoming_call(const char *modem_name, const char *call_name)
 static void handle_call_manager_event(const char *event)
 {
 	char *event_str = NULL;
-	char modem_name[MODEM_NAME_LEN];
-	char *modem_str = NULL;
+	char modem_id[MODEM_ID_LEN];
+	char *modem_id_str = NULL;
 	char *str = NULL;
 	char *end = NULL;
 	char call_name[CALL_NAME_LEN];
@@ -1664,9 +1734,9 @@ static void handle_call_manager_event(const char *event)
 
 	/* handle the actual event for VoiceCallManager */
 	if (strstr(event_str, VCM_NEW_CALL_EVENT)) {
-		modem_str = get_modem_name_from_line(event, modem_name, sizeof(modem_name));
-		if (!modem_str) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem name from incoming call event %s\n", event);
+		modem_id_str = get_modem_id_from_line(event, modem_id, sizeof(modem_id));
+		if (!modem_id_str) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem id from incoming call event %s\n", event);
 			return;
 		}
 		str = strrchr(event, '/');
@@ -1684,15 +1754,15 @@ static void handle_call_manager_event(const char *event)
 		}
 		memcpy(call_name, str, len);
 		call_name[len] = 0;
-		handle_incoming_call(modem_name, call_name);
+		handle_incoming_call(modem_id, call_name);
 	} else if (strstr(event_str, VCM_HANGUP_CALL_EVENT)) {
-		modem_str = get_modem_name_from_line(event, modem_name, sizeof(modem_name));
-		if (!modem_str) {
+		modem_id_str = get_modem_id_from_line(event, modem_id, sizeof(modem_id));
+		if (!modem_id_str) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem name from hangup call event %s\n", event);
 			return;
 		}
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Hangup call in modem %s\n", modem_name);
-		handle_call_hangup(modem_name);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Hangup call in modem %s\n", modem_id_str);
+		handle_call_hangup(modem_id_str);
 	} else {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignored VoiceCallManager event: %s\n", event_str);
 	}
@@ -1703,25 +1773,25 @@ static void handle_call_event(const char *event)
 {
 	ofono_modem_t *modem = NULL;
 	char *event_str = NULL;
-	char modem_name[MODEM_NAME_LEN];
-	char *modem_str = NULL;
+	char modem_id[MODEM_ID_LEN];
+	char *modem_id_str = NULL;
 
 	event_str = skip_sender(event);
 	if (!event_str) {
 		return;
 	}
 	if (strstr(event, ACTIVE_CALL)) {
-		modem_str = get_modem_name_from_line(event_str, modem_name, sizeof(modem_name));
-		if (!modem_str) {
+		modem_id_str = get_modem_id_from_line(event_str, modem_id, sizeof(modem_id));
+		if (!modem_id_str) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to retrieve modem name from active call event %s, you will not hear audio!\n", event);
 			return;
 		}
-		modem = switch_core_hash_find(globals.modems, modem_name);
+		modem = switch_core_hash_find(globals.modems, modem_id);
 		if (!modem) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Incoming call in unknown modem '%s'\n", modem_name);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Incoming call in unknown modem '%s'\n", modem_id);
 			return;
 		}
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Active call in modem %s, enabling audio!\n", modem_name);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Active call in modem %s, enabling audio!\n", modem_id);
 		modem_start_stream(modem);
 	} else {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Ignored voicecall event: %s\n", event);
@@ -1887,8 +1957,8 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown)
 	for (i = switch_hash_first(NULL, globals.modems); i; i = switch_hash_next(i)) {
 		switch_hash_this(i, &key, NULL, &val);
 		modem = val;
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Closing audio connection for modem %s\n", modem->name);
 		if (modem->audio_service_fd > 0) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Closing audio connection for modem %s/%s\n", modem->name, modem->id);
 			close_device(modem->audio_service_fd, modem->bluez_path);
 			bt_audio_service_close(modem->audio_service_fd);
 			modem->audio_service_fd = -1;
@@ -1900,6 +1970,74 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_handsfree_shutdown)
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Handsfree Done!\n");
 
 	return SWITCH_STATUS_SUCCESS;
+}
+
+static int parse_device_line(char *path)
+{
+	/* /org/bluez/2891/hci0/dev_00_1D_28_4B_9A_A8 */
+	ofono_modem_t *modem = NULL;
+	switch_hash_index_t *i;
+	char *line = NULL;
+	const void *key;
+	void *val;
+	char *dev = NULL;
+	char modem_id[MODEM_ID_LEN];
+	int j = 0;
+
+	line = strdup(path);
+
+	dev = strrchr(line, '/');
+	if (!dev) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "No slash in line %s\n", line);
+	}
+	dev += strlen("dev_") + 1;
+	while (*dev) {
+		if (*dev != '_') {
+			modem_id[j++] = *dev;
+		}
+		if (*dev == '\n') {
+			break;
+		}
+	}
+	modem_id[j] = 0;
+
+	/* open all audio connections to the devices */
+	for (i = switch_hash_first(NULL, globals.modems); i; i = switch_hash_next(i)) {
+		switch_hash_this(i, &key, NULL, &val);
+		modem = val;
+		if (strstr(modem->id, modem_id)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Found bluez path %s for modem %s/%s\n", path, modem->id, modem->name);
+			snprintf(modem->bluez_path, sizeof(modem->bluez_path), "%s", path);
+			break;
+		}
+	}
+}
+
+static int setup_audio_connections(void)
+{
+	ofono_modem_t *modem = NULL;
+	switch_hash_index_t *i;
+	const void *key;
+	void *val;
+
+	/* find the bluez path for each modem */
+	execute_script(NULL, LIST_DEVICES_SCRIPT, NULL, parse_device_line);
+
+	/* open all audio connections to the devices */
+	for (i = switch_hash_first(NULL, globals.modems); i; i = switch_hash_next(i)) {
+		switch_hash_this(i, &key, NULL, &val);
+		modem = val;
+		if (!strlen(modem->bluez_path)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "No audio path for modem %s/%s was found!\n", modem->name, modem->id);
+		}
+		if (modem->audio_service_fd < 0 ) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Preparing audio for modem %s/%s\n", modem->name, modem->id);
+			if (setup_sco_audio(modem)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "failed to setup audio for modem %s\n", modem->name);
+				continue;
+			}
+		}
+	}
 }
 
 #define HANDS_FREE_SYNTAX "handsfree list"
@@ -1920,6 +2058,9 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 
 	/* update modems hash with real time information */
 	load_modems();
+
+	/* try to open the audio socket for each modem */
+	setup_audio_connections();
 
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 	handsfree_endpoint_interface = switch_loadable_module_create_interface(*module_interface, SWITCH_ENDPOINT_INTERFACE);
