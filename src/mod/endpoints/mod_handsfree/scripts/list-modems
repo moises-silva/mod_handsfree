@@ -15,49 +15,49 @@ for path, properties in modems:
 	for key in properties.keys():
 		if key in ["Interfaces", "Features"]:
 			val = ""
-			for i in properties[key]:
-				val += i + " "
 		else:
 			val = str(properties[key])
-		print "    %s = %s" % (key, val)
+			print "    %s = %s" % (key, val)
 
-	for interface in properties["Interfaces"]:
-		object = dbus.Interface(bus.get_object('org.ofono', path),
-								interface)
+#	for interface in properties["Interfaces"]:
+#		object = dbus.Interface(bus.get_object('org.ofono', path),
+#								interface)
 
-		print "    [ %s ]" % (interface)
+#		print "    [ %s ]" % (interface)
 
-		try:
-			properties = object.GetProperties()
-		except:
-			continue
+#		try:
+#			properties = object.GetProperties()
+#		except:
+#			continue
 
-		for key in properties.keys():
-			if key in ["Calls",
-					"MultipartyCalls",
-					"EmergencyNumbers",
-					"SubscriberNumbers",
-					"PreferredLanguages",
-					"PrimaryContexts",
-					"LockedPins"]:
-				val = ""
-				for i in properties[key]:
-					val += i + " "
-			elif key in ["ServiceNumbers"]:
-				val = ""
-				for i in properties[key]:
-					val += "[" + i + "] = '"
-					val += properties[key][i] + "' "
-			elif key in ["MobileNetworkCodeLength",
-						"VoicemailMessageCount",
-						"MicrophoneVolume",
-						"SpeakerVolume"]:
-				val = int(properties[key])
-			elif key in ["MainMenu"]:
-				val = ", ".join([ text + " (" + str(int(icon)) +
-					")" for text, icon in properties[key] ])
-			else:
-				val = str(properties[key])
-			print "        %s = %s" % (key, val)
+#		for key in properties.keys():
+#			if key in ["Calls",
+#					"MultipartyCalls",
+#					"EmergencyNumbers",
+#					"SubscriberNumbers",
+#					"PreferredLanguages",
+#					"PrimaryContexts",
+#					"LockedPins"]:
+#				val = ""
+#				for i in properties[key]:
+#					val += i + " "
+#			elif key in ["ServiceNumbers"]:
+#				val = ""
+#				for i in properties[key]:
+#					val += "[" + i + "] = '"
+#					val += properties[key][i] + "' "
+#			elif key in ["MobileNetworkCodeLength",
+#						"VoicemailMessageCount",
+#						"MicrophoneVolume",
+#						"SpeakerVolume"]:
+#				val = int(properties[key])
+#			elif key in ["MainMenu"]:
+#				val = ", ".join([ text + " (" + str(int(icon)) +
+#					")" for text, icon in properties[key] ])
+#			else:
+#				val = str(properties[key])
+#			print "        %s = %s" % (key, val)
+#
+#	print
 
-	print
+
