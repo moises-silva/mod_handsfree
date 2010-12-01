@@ -1289,10 +1289,12 @@ static switch_status_t load_config(void)
 				continue;
 			}
 
+			modem = &globals.modems_array[modem_i];
 			memset(modem, 0, sizeof(*modem));
 			snprintf(modem->name, sizeof(modem->name), "%s", name);
 			snprintf(modem->dialplan, sizeof(modem->dialplan), "%s", "XML");
 			snprintf(modem->context, sizeof(modem->context), "%s", "public");
+			modem->audio_service_fd = -1;
 
 			for (param = switch_xml_child(mymodem, "param"); param; param = param->next) {
 				char *var = (char *) switch_xml_attr_soft(param, "name");
@@ -1308,7 +1310,7 @@ static switch_status_t load_config(void)
 			
 			switch_core_hash_insert(globals.modems, name, modem);
 
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Added modem '%s'\n", modem);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Added modem '%s'\n", modem->name);
 
 			switch_mutex_init(&modem->mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
 			switch_mutex_init(&modem->flag_mutex, SWITCH_MUTEX_NESTED, globals.module_pool);
@@ -1330,7 +1332,10 @@ static void execute_script(switch_stream_handle_t *stream, char *script, char *a
 {
 	char cmdpath[1024];
 	char linebuf[2048];
+	char *eol = NULL;
+	char *lineptr = NULL;
 	struct pollfd fdset;
+	int linelen = 0;
 	int rc = 0;
 	int tofs[2];
 	int fromfs[2];
@@ -1345,18 +1350,9 @@ static void execute_script(switch_stream_handle_t *stream, char *script, char *a
 		return;
 	}
 
-	if (pipe(tofs)) {
-		close(tofs[0]);
-		close(tofs[1]);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create pipe to monitor ofono events\n");
-		return;
-	}
-
 	if (pipe(fromfs)) {
 		close(tofs[0]);
 		close(tofs[1]);
-		close(fromfs[0]);
-		close(fromfs[1]);
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create pipe to monitor ofono events\n");
 		return;
 	}
@@ -1365,7 +1361,7 @@ static void execute_script(switch_stream_handle_t *stream, char *script, char *a
 
 	pid = fork();
 	if (pid < 0) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to fork to execute script %s\n", cmdpath);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to fork to execute script '%s'\n", cmdpath);
 		close(tofs[0]);
 		close(tofs[1]);
 		close(fromfs[0]);
@@ -1376,7 +1372,7 @@ static void execute_script(switch_stream_handle_t *stream, char *script, char *a
 	if (!pid) {
 		dup2(fromfs[0], STDIN_FILENO);
 		dup2(tofs[1], STDOUT_FILENO);
-		for (fd = STDERR_FILENO + 1; fd < (2^65536); fd++) {
+		for (fd = STDERR_FILENO + 1; fd < 65535; fd++) {
 			close(fd);
 		}
 		execv(cmdpath, argv);
@@ -1385,23 +1381,25 @@ static void execute_script(switch_stream_handle_t *stream, char *script, char *a
 
 	fdset.fd = tofs[0];
 	fdset.events = POLLIN | POLLERR;
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Waiting output of command '%s'\n", cmdpath);
+	lineptr = linebuf;
 	while (globals.running) {
 		rc = waitpid(pid, NULL, WNOHANG);
 		if (rc < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to wait for script %s: %s\n", script, strerror(errno));
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to wait for script '%s': %s\n", script, strerror(errno));
 			break;
 		}
 		if (rc > 0) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "script %s terminated\n", script);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "script '%s' terminated\n", script);
 			break;
 		}
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "script %s running\n", script);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "script '%s' running\n", script);
 		rc = poll(&fdset, 1, 100);
 		if (rc < 0) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to poll output of script %s: %s\n", script, strerror(errno));
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to poll output of script '%s': %s\n", script, strerror(errno));
 			break;
 		}
 		if (!rc) {
@@ -1409,28 +1407,47 @@ static void execute_script(switch_stream_handle_t *stream, char *script, char *a
 		}
 		if (rc > 0) {
 			if (POLLIN & fdset.revents) {
-				rc = read(tofs[0], linebuf, sizeof(linebuf)-1);
+				rc = read(tofs[0], lineptr, sizeof(linebuf) - linelen - 1);
 				if (rc < 0) {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to read script output: %s\n", strerror(errno));
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to read script '%s' output: %s\n", script, strerror(errno));
 					break;
 				}
 				if (rc == 0) {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "No script output?\n");
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Script '%s' did not have any output?\n", script);
 					break;
 				}
-				linebuf[rc] = 0;
-				if (stream) {
-					stream->write_function(stream, "%s", linebuf);
-				} else {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s\n", linebuf);
+				linelen += rc;
+				lineptr += rc;
+				if (linelen >= (sizeof(linebuf) - 1)) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Too much line output from script '%s'!\n", script);
+					break;
 				}
-				if (consumer_cb) {
-					rc = consumer_cb(linebuf);
-					if (rc) {
-						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Consumer callback requested to stop\n");
-						break;
+				linebuf[linelen] = 0;
+				/* there could potentially be more than one \n per read */
+				eol = strchr(linebuf, '\n');
+				if (!eol) {
+					continue;
+				}
+				lineptr = linebuf;
+				while (eol) {
+					*eol = 0;
+					if (stream) {
+						stream->write_function(stream, "%s\n", lineptr);
+					} else {
+						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s\n", lineptr);
 					}
+					if (consumer_cb) {
+						rc = consumer_cb(lineptr);
+						if (rc) {
+							switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Consumer callback requested to stop\n");
+							break;
+						}
+					}
+					lineptr = (eol + 1);
+					eol = strchr(lineptr, '\n');
 				}
+				linelen = strlen(lineptr);
+				lineptr = ((&linebuf[0]) + linelen);
 			} else if (POLLERR & fdset.revents) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Poll error when waiting for script output\n");
 				break;
@@ -1481,6 +1498,8 @@ end:
 	return SWITCH_STATUS_SUCCESS;
 }
 
+#define NAME_PARAMETER "Name = "
+#define ONLINE_PARAMETER "Online = "
 static int parse_modem_line(char *line)
 {
 	static struct {
@@ -1493,9 +1512,9 @@ static int parse_modem_line(char *line)
 		.modem = NULL,
 	};
 	int online = 0;
-	char *eolchar = NULL;
 	char *val = NULL;
 
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Parsing line '%s'\n", line);
 	if (line[0] == '[') {
 		locals.id_str = get_modem_id_from_line(line, locals.modem_id, sizeof(locals.modem_id));
 		if (!locals.id_str) {
@@ -1504,43 +1523,37 @@ static int parse_modem_line(char *line)
 		}
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Parsing modem '%s' runtime configuration\n", locals.id_str);
 	}
-
-	if ((val = strcasestr(line, "Name = "))) {
+	else if ((val = strcasestr(line, NAME_PARAMETER))) {
 		if (!locals.id_str) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Name with no modem in line '%s'\n", line);
 			return 0;
 		}
-		val++;
-		eolchar = strchr(val, '\n');
-		if (!eolchar) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Ignored modem '%s' with no EOL character\n", val);
-			return 0;
-		}
-		*eolchar = 0;
-		locals.modem = switch_core_hash_find(globals.modems, val);
-		if (!locals.modem) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Ignored modem '%s' not present in configuration\n", val);
-			return 0;
-		}
-		/* we create a separate register to find the modem by id */
+		val += strlen(NAME_PARAMETER);
+		/* try to find id duplicates first, unlikely, but better safe than sorry */
 		locals.modem = switch_core_hash_find(globals.modems, locals.id_str);
 		if (locals.modem) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Modem %s was found twice!\n", locals.id_str);
 			return -1;
 		}
+		/* now find a modem registered with that name */
+		locals.modem = switch_core_hash_find(globals.modems, val);
+		if (!locals.modem) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Ignored modem '%s' not present in configuration\n", val);
+			return 0;
+		}
+		/* now we create a duplicate register to find the modem by id */
 		switch_core_hash_insert(globals.modems, locals.id_str, locals.modem);
 		snprintf(locals.modem->id, sizeof(locals.modem->id), "%s", locals.id_str);
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Modem %s has id '%s'\n", locals.modem->name, locals.modem->id);
-
 	}
-	else if ((val = strcasestr(line, "Online = "))) {
+	else if ((val = strcasestr(line, ONLINE_PARAMETER))) {
 		if (!locals.modem) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Online parameter with no modem in line '%s'\n", line);
 			return 0;
 		}
-		val++;
+		val += strlen(ONLINE_PARAMETER);
 		locals.modem->online = atoi(val);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Modem %s is %s\n", locals.modem->online ? "online" : "offline");
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Modem %s is %s\n", locals.modem->name, locals.modem->online ? "online" : "offline");
 		/* we're done, clear the modem */
 		memset(&locals, 0, sizeof(locals));
 	}
@@ -1588,9 +1601,17 @@ static char *get_modem_id_from_line(const char *line, char *modem_id, int modem_
 		 && *(str + 4) == '/') {
 			str += 5;
 			end = strchr(str, '/');
-			if (!end || end == str) {
+			if (!end) {
+				end = strchr(str, ' ');
+				if (!end) {
+					return NULL;
+				}
+				goto getname;
+			}
+			if (end == str) {
 				return NULL;
 			}
+getname:
 			len = (long)end - (long)str;
 			if (len >= modem_id_len) {
 				return NULL;
@@ -1828,6 +1849,7 @@ static void process_event(const char *event)
 	}
 }
 
+static int setup_audio_connections(void);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 {
 	int tofs[2];
@@ -1841,6 +1863,12 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_handsfree_runtime)
 	char cmdpath[1024];
 	struct pollfd fdset;
 	int rc = 0;
+
+	/* update modems hash with runtime information */
+	load_modems();
+
+	/* try to open the audio socket for each modem */
+	setup_audio_connections();
 
 	snprintf(cmdpath, sizeof(cmdpath), "%s%s%s", SWITCH_GLOBAL_dirs.script_dir, SWITCH_PATH_SEPARATOR, MONITOR_SCRIPT);
 
@@ -1980,6 +2008,7 @@ static int parse_device_line(char *path)
 	char *line = NULL;
 	const void *key;
 	void *val;
+	char *c = NULL;
 	char *dev = NULL;
 	char modem_id[MODEM_ID_LEN];
 	int j = 0;
@@ -1992,25 +2021,35 @@ static int parse_device_line(char *path)
 	}
 	dev += strlen("dev_") + 1;
 	while (*dev) {
+		if (*dev == '\n') {
+			break;
+		}
 		if (*dev != '_') {
 			modem_id[j++] = *dev;
 		}
-		if (*dev == '\n') {
+		dev++;
+		if (j == (sizeof(modem_id) - 1)) {
 			break;
 		}
 	}
 	modem_id[j] = 0;
 
-	/* open all audio connections to the devices */
+	/* try to find the device */
 	for (i = switch_hash_first(NULL, globals.modems); i; i = switch_hash_next(i)) {
 		switch_hash_this(i, &key, NULL, &val);
 		modem = val;
 		if (strstr(modem->id, modem_id)) {
+			c = strchr(path, '\n');
+			if (c) {
+				*c = 0;
+			}
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Found bluez path %s for modem %s/%s\n", path, modem->id, modem->name);
 			snprintf(modem->bluez_path, sizeof(modem->bluez_path), "%s", path);
 			break;
 		}
 	}
+	switch_safe_free(line);
+	return 0;
 }
 
 static int setup_audio_connections(void)
@@ -2027,15 +2066,20 @@ static int setup_audio_connections(void)
 	for (i = switch_hash_first(NULL, globals.modems); i; i = switch_hash_next(i)) {
 		switch_hash_this(i, &key, NULL, &val);
 		modem = val;
-		if (!strlen(modem->bluez_path)) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "No audio path for modem %s/%s was found!\n", modem->name, modem->id);
-		}
 		if (modem->audio_service_fd < 0 ) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Preparing audio for modem %s/%s\n", modem->name, modem->id);
+			if (!strlen(modem->bluez_path)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "No audio path for modem %s/%s was found!\n", modem->name, modem->id);
+				continue;
+			}
+			if (!modem->online) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Modem %s/%s is not online, cannot open audio connection!\n", modem->name, modem->id);
+				continue;
+			}
 			if (setup_sco_audio(modem)) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "failed to setup audio for modem %s\n", modem->name);
 				continue;
 			}
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Created audio connection for modem %s/%s\n", modem->name, modem->id);
 		}
 	}
 }
@@ -2055,12 +2099,6 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_handsfree_load)
 
 	/* read config */
 	load_config();
-
-	/* update modems hash with real time information */
-	load_modems();
-
-	/* try to open the audio socket for each modem */
-	setup_audio_connections();
 
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 	handsfree_endpoint_interface = switch_loadable_module_create_interface(*module_interface, SWITCH_ENDPOINT_INTERFACE);
