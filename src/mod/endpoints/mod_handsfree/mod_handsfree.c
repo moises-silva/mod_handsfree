@@ -681,7 +681,7 @@ static switch_status_t channel_on_hangup(switch_core_session_t *session)
 	switch_mutex_lock(modem->mutex);
 	if (!modem->got_hangup) {
 		modem_stop_stream(modem);
-		execute_script(NULL, HANGUP_SCRIPT, NULL, NULL);
+		execute_script(NULL, HANGUP_SCRIPT, modem->name, NULL);
 		modem->got_hangup = 1;
 	}
 	switch_mutex_unlock(modem->mutex);
@@ -1006,7 +1006,7 @@ static switch_status_t channel_receive_message(switch_core_session_t *session, s
 		{
 			switch_mutex_lock(modem->mutex);
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Answering modem %s\n", modem->name);
-			execute_script(NULL, ANSWER_SCRIPT, NULL, NULL);
+			execute_script(NULL, ANSWER_SCRIPT, modem->name, NULL);
 			/* we do not start audio streaming until we get VoiceCall event with state == active */
 			switch_mutex_unlock(modem->mutex);
 		}
@@ -1357,7 +1357,7 @@ static void execute_script(switch_stream_handle_t *stream, char *script, char *a
 		return;
 	}
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Launching command %s\n", cmdpath);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Launching command '%s' with args '%s'\n", cmdpath, arg1 ? arg1 : "");
 
 	pid = fork();
 	if (pid < 0) {
