@@ -1,8 +1,15 @@
 #!/usr/bin/python
 
+import sys
 import dbus
 
 bus = dbus.SystemBus()
+
+if len(sys.argv) != 2:
+	print "Error: Modem name required!"
+	sys.exit(1);
+
+modemName = sys.argv[1]
 
 manager = dbus.Interface(bus.get_object('org.ofono', '/'),
 						'org.ofono.Manager')
@@ -13,6 +20,9 @@ for path, properties in modems:
 	print "[ %s ]" % (path)
 
 	if "org.ofono.VoiceCallManager" not in properties["Interfaces"]:
+		continue
+
+	if properties["Name"] != modemName:
 		continue
 
 	mgr = dbus.Interface(bus.get_object('org.ofono', path),
@@ -28,6 +38,6 @@ for path, properties in modems:
 
 		object.Hangup()
 
-		print
+		print "Hangup Done"
 
-print "Hangup Done"
+
