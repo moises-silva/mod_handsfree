@@ -660,9 +660,9 @@ static void modem_stop_stream(ofono_modem_t *modem)
 {
 	if (modem->audio_fd >= 0) {
 		close(modem->audio_fd);
-		modem->audio_fd = -1;
 		stop_stream(modem->audio_service_fd, modem->bluez_path);
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Stopped streaming on modem %s with fd %d\n", modem->name, modem->audio_fd);
+		modem->audio_fd = -1;
 	}
 }
 
@@ -855,6 +855,10 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 			rc = read(modem->audio_fd, pcmbuf, sizeof(pcmbuf));
 
 			if (rc < 0) {
+				if (errno == EBADF) {
+					/* we get this when bluez closes the audio fd on hangup before we see the hangup message */
+					break;
+				}
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error reading from audio connection: %s\n", strerror(errno));
 				break;
 			}
@@ -1565,24 +1569,29 @@ static int parse_modem_line(char *line)
 		char modem_id[MODEM_ID_LEN];
 		char *id_str;
 		ofono_modem_t *modem;
+		uint8_t ignoring;
 	} locals = {
 		.modem_id = { 0 },
 		.id_str = NULL,
 		.modem = NULL,
+		.ignoring = 0,
 	};
 	int online = 0;
 	char *val = NULL;
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Parsing line '%s'\n", line);
 	if (line[0] == '[') {
+		locals.ignoring = 0;
 		locals.id_str = get_modem_id_from_line(line, locals.modem_id, sizeof(locals.modem_id));
 		if (!locals.id_str) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Could not get modem from line '%s'\n", line);
 			return 0;
 		}
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Parsing modem '%s' runtime configuration\n", locals.id_str);
-	}
-	else if ((val = strcasestr(line, NAME_PARAMETER))) {
+	} else if (locals.ignoring) {
+		/* no matter the parameter, we're ignoring this modem */
+		return 0;
+	} else if ((val = strcasestr(line, NAME_PARAMETER))) {
 		if (!locals.id_str) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Name with no modem in line '%s'\n", line);
 			return 0;
@@ -1597,7 +1606,8 @@ static int parse_modem_line(char *line)
 		/* now find a modem registered with that name */
 		locals.modem = switch_core_hash_find(globals.modems, val);
 		if (!locals.modem) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Ignored modem '%s' not present in configuration\n", val);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Ignored modem '%s' not present in configuration\n", val);
+			locals.ignoring = 1;
 			return 0;
 		}
 		/* now we create a duplicate register to find the modem by id */
