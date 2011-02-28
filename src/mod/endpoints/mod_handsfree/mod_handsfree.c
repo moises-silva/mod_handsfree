@@ -93,6 +93,9 @@ typedef struct ofono_modem {
 	uint8_t pcm_read_buf[SCO_PCM_MTU];
 	int pcm_read_buf_len;
 	uint64_t readcnt;
+#if 0
+	FILE *infile;
+#endif
 
 	unsigned char databuf[SWITCH_RECOMMENDED_BUFFER_SIZE];
 	switch_core_session_t *session;
@@ -682,6 +685,13 @@ static switch_status_t channel_on_hangup(switch_core_session_t *session)
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "%s CHANNEL HANGUP\n", switch_channel_get_name(channel));
 
 	switch_mutex_lock(modem->mutex);
+#if 0
+	if (modem->infile) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "%s CHANNEL HANGUP, closing file\n", switch_channel_get_name(channel));
+		fclose(modem->infile);
+		modem->infile = NULL;
+	}
+#endif
 	if (!modem->got_hangup) {
 		modem_stop_stream(modem);
 		execute_script(NULL, HANGUP_SCRIPT, modem->name, NULL, NULL);
@@ -781,6 +791,9 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 	*frame = NULL;
 
 	modem->readcnt++;
+	if (modem->readcnt == 1000) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "first modem %s read: %llu\n", modem->name, modem->readcnt);
+	}
 	if (!(modem->readcnt % 1000)) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "modem %s read: %llu\n", modem->name, modem->readcnt);
 	}
@@ -789,6 +802,7 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 	if (modem->pcm_read_buf_len) {
 		memcpy(dataptr, modem->pcm_read_buf, modem->pcm_read_buf_len);
 		dataptr += modem->pcm_read_buf_len;
+		modem->read_frame.datalen += modem->pcm_read_buf_len;
 		modem->pcm_read_buf_len = 0;
 	}
 	for ( ; ; ) {
@@ -873,9 +887,11 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 				diff = len - FIXED_READ_SIZE;
 				len = rc - diff;
 				memcpy(dataptr, pcmbuf, len);
-				modem->read_frame.datalen += rc;
-				memcpy(modem->pcm_read_buf, &pcmbuf[len], diff);
-				modem->pcm_read_buf_len = len;
+				modem->read_frame.datalen += len;
+				if (diff) {
+					memcpy(modem->pcm_read_buf, &pcmbuf[len], diff);
+					modem->pcm_read_buf_len = diff;
+				}
 				break;
 			}
 			memcpy(dataptr, pcmbuf, rc);
@@ -896,6 +912,11 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 	}
 
 	*frame = &modem->read_frame;
+#if 0
+	if (modem->infile)
+		fwrite(modem->read_frame.data, 1, modem->read_frame.datalen, modem->infile);
+#endif
+
 	return SWITCH_STATUS_SUCCESS;
 
 do_cng:
@@ -968,7 +989,7 @@ static switch_status_t channel_write_frame(switch_core_session_t *session, switc
 		datalen = frame->datalen - datalen;
 	} else {
 		/* nothing on modem write buffer, we can start from the beginning of the frame */
-		dataptr = frame->data + datalen;
+		dataptr = frame->data;
 		datalen = frame->datalen;
 	}
 
@@ -1077,6 +1098,13 @@ static switch_status_t modem_init(ofono_modem_t *modem, const char *call_name, s
 	/* associate modem to session and viceversa */
 	modem->session = session;
 	switch_core_session_set_private(session, modem);
+
+#if 0
+	modem->infile = fopen("/tmp/modem-in.raw", "w");
+	if (!modem->infile) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Failed to create in file for modem %s\n", modem->name);
+	}
+#endif
 
 	switch_mutex_unlock(modem->mutex);
 	return SWITCH_STATUS_SUCCESS;
