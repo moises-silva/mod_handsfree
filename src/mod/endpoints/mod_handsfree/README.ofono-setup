@@ -1,0 +1,44 @@
+This is a quick tutorial on how to get working the handsfree profile with ofono. I will keep adding information as I discover it (or as someone teach me on the mailing list).
+
+== Software versions ==
+
+DBUS >= 1.3
+
+In order to use the Handsfree profile functionality you MUST have DBUS >= 1.3, otherwise it won't work, don't waste your time. 
+Many Linux distributions do not include DBUS >= 1.3, you will have to find a way to upgrade yourself. In my case I used Linux Arch, which includes at least DBUS 1.3.
+
+Other than DBUS >= 1.3, I am not sure about the exact versions of bluez that will work, but I have bluez 4.72 and blueman 1.21
+
+Ofono version 0.29
+
+== Procedure ==
+
+Make sure your bluetooth adapter is detected. 
+
+First you must plugin your bluetooth adapter (if you have an usb adapter). In order to verify if your adapter was recognized, you can use hciconfig.
+
+"hciconfig" is pretty much to bluetooth devices as "ifconfig" for network devices.
+
+== Configure bluez ==
+Configuration in bluez is minimal, all you need is edit /etc/bluetooth/audio.conf and add this to the [general] section
+
+Enable=Gateway
+
+== Pair your device ==
+Pairing your bluetooth adapter with your cell phone should be straight forward using a tool like blueman. When you connect your bluetooth adapter the blueman applet 
+will pop up (and bluetoothd will be launched if it was not already started) and you can search for your cell phone and select the pair option.
+
+You will be asked to enter a PIN (or one will be generated for you), you must enter this PIN in your cell phone when prompted.
+
+== Launch ofono ==
+No configuration is required for ofono. You can launch the ofono daemon like this to see debugging output:
+
+ofonod -n -d
+
+Ofono should detect your cell phone and add it to the array of modems.
+
+You should be able to run the ./list-modems python script in the ofono distribution and your cell phone will be listed as a modem.
+
+You can use the ./enable-modem python script to enable it. Your cell phone should see the connection and enter in handsfree mode.
+
+At this point you can use ./dial-number to use your cell phone to place an outgoing call!
