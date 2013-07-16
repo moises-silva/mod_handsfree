@@ -761,11 +761,13 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 	switch_channel_t *channel = NULL;
 	ofono_modem_t *modem = NULL;
 	switch_byte_t *dataptr;
+#if 0
 	union {
 		bt_audio_msg_header_t h;
 		bt_audio_error_t error;
 		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
 	} msg;
+#endif
 	struct pollfd svcpoll[2];
 	uint8_t pcmbuf[SCO_PCM_MTU];
 	int rc = 0;
