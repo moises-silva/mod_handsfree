@@ -1604,7 +1604,6 @@ static int parse_modem_line(char *line)
 		.modem = NULL,
 		.ignoring = 0,
 	};
-	int online = 0;
 	char *val = NULL;
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Parsing line '%s'\n", line);
