@@ -2256,6 +2256,8 @@ static int setup_audio_connections(void)
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Created audio connection for modem %s/%s\n", modem->name, modem->id);
 		}
 	}
+
+	return 0;
 }
 
 #define HANDS_FREE_SYNTAX "handsfree list"
