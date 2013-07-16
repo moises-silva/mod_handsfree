@@ -985,11 +985,11 @@ static switch_status_t channel_write_frame(switch_core_session_t *session, switc
 			return SWITCH_STATUS_GENERR;
 		}
 		/* continue writing the frame where left */
-		dataptr = frame->data + datalen;
+		dataptr = (char*)frame->data + datalen;
 		datalen = frame->datalen - datalen;
 	} else {
 		/* nothing on modem write buffer, we can start from the beginning of the frame */
-		dataptr = frame->data;
+		dataptr = (char*)frame->data;
 		datalen = frame->datalen;
 	}
 
