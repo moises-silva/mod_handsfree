@@ -969,7 +969,7 @@ static switch_status_t channel_write_frame(switch_core_session_t *session, switc
 #endif
 	if (modem->pcm_write_buf_len) {
 		datalen = SCO_PCM_MTU - modem->pcm_write_buf_len;
-		dataptr = pcmbuf;
+		dataptr = (char*)pcmbuf;
 		memcpy(dataptr, modem->pcm_write_buf, modem->pcm_write_buf_len);
 		dataptr += modem->pcm_write_buf_len;
 		memcpy(dataptr, frame->data, datalen);
