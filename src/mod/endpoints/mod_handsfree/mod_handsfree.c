@@ -232,7 +232,7 @@ static int send_message(int servicefd, const bt_audio_msg_header_t *msg)
 		return -1;
 	}
 	if (r != msg->length) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Only wrote %d bytes out of %d\n", r, msg->length);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Only wrote %"SWITCH_SSIZE_T_FMT" bytes out of %d\n", r, msg->length);
 		return -1;
 	}
 	return 0;
@@ -259,12 +259,12 @@ static int read_message(int svcsock, bt_audio_msg_header_t *msg, size_t max)
 	}
 
 	if (r != sizeof(*msg)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "read only %d out of %d bytes, discarding ...\n", r, sizeof(*msg));
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "read only %"SWITCH_SSIZE_T_FMT" out of %zd bytes, discarding ...\n", r, sizeof(*msg));
 		return -1;
 	}
 
 	if (msg->length > max) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Not enough room to fit %d bytes, only room for %d, discarding ...\n", r, max);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Not enough room to fit %"SWITCH_SSIZE_T_FMT" bytes, only room for %"SWITCH_SIZE_T_FMT", discarding ...\n", r, max);
 		return -1;
 	}
 
@@ -282,7 +282,7 @@ static int read_message(int svcsock, bt_audio_msg_header_t *msg, size_t max)
 			return -1;
 		}
 		if (r != payloadlen) {
-			fprintf(stderr, "read only %d out of %d payload bytes, discarding ...\n", r, sizeof(*msg));
+			fprintf(stderr, "read only %"SWITCH_SSIZE_T_FMT" out of %zd payload bytes, discarding ...\n", r, sizeof(*msg));
 			return -1;
 		}
 	}
@@ -794,10 +794,10 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 
 	modem->readcnt++;
 	if (modem->readcnt == 1000) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "first modem %s read: %llu\n", modem->name, modem->readcnt);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "first modem %s read: %zd\n", modem->name, modem->readcnt);
 	}
 	if (!(modem->readcnt % 1000)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "modem %s read: %llu\n", modem->name, modem->readcnt);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "modem %s read: %zd\n", modem->name, modem->readcnt);
 	}
 
 	dataptr = (switch_byte_t *)modem->read_frame.data;
