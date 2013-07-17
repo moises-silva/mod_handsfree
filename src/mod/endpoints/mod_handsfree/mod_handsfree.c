@@ -232,7 +232,7 @@ static int send_message(int servicefd, const bt_audio_msg_header_t *msg)
 		return -1;
 	}
 	if (r != msg->length) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Only wrote %d bytes out of %d\n", r, msg->length);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Only wrote %"SWITCH_SSIZE_T_FMT" bytes out of %d\n", r, msg->length);
 		return -1;
 	}
 	return 0;
@@ -259,12 +259,12 @@ static int read_message(int svcsock, bt_audio_msg_header_t *msg, size_t max)
 	}
 
 	if (r != sizeof(*msg)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "read only %d out of %d bytes, discarding ...\n", r, sizeof(*msg));
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "read only %"SWITCH_SSIZE_T_FMT" out of %zd bytes, discarding ...\n", r, sizeof(*msg));
 		return -1;
 	}
 
 	if (msg->length > max) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Not enough room to fit %d bytes, only room for %d, discarding ...\n", r, max);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Not enough room to fit %"SWITCH_SSIZE_T_FMT" bytes, only room for %"SWITCH_SIZE_T_FMT", discarding ...\n", r, max);
 		return -1;
 	}
 
@@ -282,7 +282,7 @@ static int read_message(int svcsock, bt_audio_msg_header_t *msg, size_t max)
 			return -1;
 		}
 		if (r != payloadlen) {
-			fprintf(stderr, "read only %d out of %d payload bytes, discarding ...\n", r, sizeof(*msg));
+			fprintf(stderr, "read only %"SWITCH_SSIZE_T_FMT" out of %zd payload bytes, discarding ...\n", r, sizeof(*msg));
 			return -1;
 		}
 	}
@@ -761,11 +761,13 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 	switch_channel_t *channel = NULL;
 	ofono_modem_t *modem = NULL;
 	switch_byte_t *dataptr;
+#if 0
 	union {
 		bt_audio_msg_header_t h;
 		bt_audio_error_t error;
 		uint8_t buf[BT_SUGGESTED_BUFFER_SIZE];
 	} msg;
+#endif
 	struct pollfd svcpoll[2];
 	uint8_t pcmbuf[SCO_PCM_MTU];
 	int rc = 0;
@@ -792,10 +794,10 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 
 	modem->readcnt++;
 	if (modem->readcnt == 1000) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "first modem %s read: %llu\n", modem->name, modem->readcnt);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "first modem %s read: %zd\n", modem->name, modem->readcnt);
 	}
 	if (!(modem->readcnt % 1000)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "modem %s read: %llu\n", modem->name, modem->readcnt);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "modem %s read: %zd\n", modem->name, modem->readcnt);
 	}
 
 	dataptr = (switch_byte_t *)modem->read_frame.data;
@@ -969,7 +971,7 @@ static switch_status_t channel_write_frame(switch_core_session_t *session, switc
 #endif
 	if (modem->pcm_write_buf_len) {
 		datalen = SCO_PCM_MTU - modem->pcm_write_buf_len;
-		dataptr = pcmbuf;
+		dataptr = (char*)pcmbuf;
 		memcpy(dataptr, modem->pcm_write_buf, modem->pcm_write_buf_len);
 		dataptr += modem->pcm_write_buf_len;
 		memcpy(dataptr, frame->data, datalen);
@@ -985,11 +987,11 @@ static switch_status_t channel_write_frame(switch_core_session_t *session, switc
 			return SWITCH_STATUS_GENERR;
 		}
 		/* continue writing the frame where left */
-		dataptr = frame->data + datalen;
+		dataptr = (char*)frame->data + datalen;
 		datalen = frame->datalen - datalen;
 	} else {
 		/* nothing on modem write buffer, we can start from the beginning of the frame */
-		dataptr = frame->data;
+		dataptr = (char*)frame->data;
 		datalen = frame->datalen;
 	}
 
@@ -1189,7 +1191,7 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Cannot place outgoing call in unknown modem '%s'\n", argv[0]);
 		return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
 	}
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Placing call in modem %s (%s)\n", modem, modem->id);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Placing call in modem %s (%s)\n", modem->name, modem->id);
 
 	switch_mutex_lock(modem->mutex);
 
@@ -1604,7 +1606,6 @@ static int parse_modem_line(char *line)
 		.modem = NULL,
 		.ignoring = 0,
 	};
-	int online = 0;
 	char *val = NULL;
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Parsing line '%s'\n", line);
@@ -2257,6 +2258,8 @@ static int setup_audio_connections(void)
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Created audio connection for modem %s/%s\n", modem->name, modem->id);
 		}
 	}
+
+	return 0;
 }
 
 #define HANDS_FREE_SYNTAX "handsfree list"
