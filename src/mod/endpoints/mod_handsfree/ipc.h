@@ -188,7 +188,10 @@ typedef struct {
 	uint8_t length;
 	uint8_t configured;
 	uint8_t lock;
-	uint8_t data[];
+	/* NOTE a variable length array within another struct is an error.
+	   I believe the intention is the above is a header for the other structs
+	   In which case this element is not required, and is not used
+	uint8_t data[];*/
 } __attribute__ ((packed)) codec_capabilities_t;
 
 typedef struct {
