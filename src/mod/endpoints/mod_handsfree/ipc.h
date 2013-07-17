@@ -188,7 +188,7 @@ typedef struct {
 	uint8_t length;
 	uint8_t configured;
 	uint8_t lock;
-	uint8_t data[0];
+	uint8_t data[];
 } __attribute__ ((packed)) codec_capabilities_t;
 
 typedef struct {
@@ -223,7 +223,7 @@ struct bt_get_capabilities_rsp {
 	char			source[18];	/* Address of the local Device */
 	char			destination[18];/* Address of the remote Device */
 	char			object[128];	/* DBus object path */
-	uint8_t			data[0];	/* First codec_capabilities_t */
+	uint8_t			data[];	/* First codec_capabilities_t */
 } __attribute__ ((packed));
 
 struct bt_open_req {
